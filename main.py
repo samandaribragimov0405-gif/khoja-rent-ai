@@ -8,7 +8,8 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, MenuButtonCommands, ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -55,6 +56,21 @@ account_views = set()
 
 def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def main_reply_keyboard(user_id: int):
+    rows = [
+        [KeyboardButton(text="🎮 Akkauntlar"), KeyboardButton(text="🎁 BONUS")],
+        [KeyboardButton(text="💬 Admin bilan aloqa")],
+    ]
+    if user_id == ADMIN_ID:
+        rows.append([KeyboardButton(text="⚙️ Admin paneli")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Kerakli bo'limni tanlang"
+    )
 
 
 def tariff_title(hours: int, price: int) -> str:
@@ -149,20 +165,21 @@ async def init_db():
             """, hours, price)
 
 
-@dp.message(Command("start"))
-async def start(m: Message):
-    rows = [
-        [InlineKeyboardButton(text="🎮 Akkauntlar", callback_data="accounts")],
-        [InlineKeyboardButton(text="🎁 BONUS", callback_data="bonus")],
-        [InlineKeyboardButton(text="💬 Admin bilan aloqa", url="https://t.me/khoja_arenda")]
-    ]
-    if m.from_user.id == ADMIN_ID:
-        rows.append([InlineKeyboardButton(text="⚙️ Admin paneli", callback_data="admin:panel")])
+@dp.message(Command("menu"))
+async def show_menu(m: Message):
     await m.answer(
-        "Assalomu alaykum! KHOJA RENT AI botiga xush kelibsiz.\nKerakli bo'limni tanlang:",
-        reply_markup=kb(rows)
+        "Asosiy menyu:",
+        reply_markup=main_reply_keyboard(m.from_user.id)
     )
 
+
+@dp.message(Command("start"))
+async def start(m: Message):
+    await m.answer(
+        "Assalomu alaykum! KHOJA RENT AI botiga xush kelibsiz.\\n"
+        "Pastdagi menyudan kerakli bo'limni tanlang:",
+        reply_markup=main_reply_keyboard(m.from_user.id)
+    )
 
 
 async def get_bonus_stats(user_id: int):
@@ -947,6 +964,58 @@ async def admin_toggle_save(m: Message, state: FSMContext):
     await update_account_views()
 
 
+@dp.message(F.text == "🎮 Akkauntlar")
+async def reply_menu_accounts(m: Message):
+    text, markup = await account_list_view()
+    msg = await m.answer(text, reply_markup=markup)
+    account_views.add((msg.chat.id, msg.message_id))
+
+
+@dp.message(F.text == "🎁 BONUS")
+async def reply_menu_bonus(m: Message):
+    total, pending, paid, claimable = await get_bonus_stats(m.from_user.id)
+    progress = total % 10
+    remaining = 10 - progress if progress else 10
+    text = (
+        "🎁 KHOJA RENT BONUS\\n\\n"
+        f"Jami tasdiqlangan ijaralar: {total} ta\\n"
+        f"Keyingi yutuq uchun: {progress}/10 ta\\n"
+        f"Yana kerak: {remaining} ta\\n"
+        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\\n\\n"
+        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\\n"
+        f"Oldin to'langan cashback: {paid:,} so'm"
+    )
+    buttons = []
+    if claimable:
+        buttons.append([InlineKeyboardButton(
+            text=f"🎉 Yutuqni olish ({claimable} ta)",
+            callback_data="bonus:claim"
+        )])
+    await m.answer(text, reply_markup=kb(buttons) if buttons else None)
+
+
+@dp.message(F.text == "💬 Admin bilan aloqa")
+async def reply_menu_contact(m: Message):
+    await m.answer("Admin bilan bog'lanish: https://t.me/khoja_arenda")
+
+
+@dp.message(F.text == "⚙️ Admin paneli")
+async def reply_menu_admin(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    await m.answer(
+        "⚙️ ADMIN PANELI — amalni tanlang:",
+        reply_markup=kb([
+            [InlineKeyboardButton(text="📋 Akkauntlar va narxlar", callback_data="admin:list")],
+            [InlineKeyboardButton(text="✏️ Akkaunt nomini/almashtirish", callback_data="admin:rename")],
+            [InlineKeyboardButton(text="💰 Narxni o'zgartirish", callback_data="admin:price")],
+            [InlineKeyboardButton(text="🔄 Akkauntni yashirish/ochish", callback_data="admin:toggle")],
+            [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")],
+            [InlineKeyboardButton(text="🎁 Cashback so'rovlari", callback_data="admin:cashbacks")],
+        ])
+    )
+
+
 async def expiry_watcher():
     while True:
         try:
@@ -986,6 +1055,15 @@ async def expiry_watcher():
 
 async def main():
     await init_db()
+
+    # Telegram chat input yonidagi menyu tugmasini yoqadi.
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Botni boshlash"),
+        BotCommand(command="menu", description="Asosiy menyuni ochish"),
+        BotCommand(command="accounts", description="Akkauntlar ro'yxati"),
+    ])
+
     asyncio.create_task(expiry_watcher())
     await dp.start_polling(bot)
 
