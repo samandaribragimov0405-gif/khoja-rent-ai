@@ -37,6 +37,12 @@ async def init_db():
             hourly_price BIGINT NOT NULL,
             active BOOLEAN NOT NULL DEFAULT TRUE
         );
+        CREATE TABLE IF NOT EXISTS account_prices(
+            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            hours INTEGER NOT NULL,
+            price BIGINT NOT NULL CHECK(price >= 0),
+            PRIMARY KEY(account_id, hours)
+        );
         CREATE TABLE IF NOT EXISTS bookings(
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
@@ -69,13 +75,18 @@ async def start(m: Message):
 @dp.callback_query(F.data == "accounts")
 async def accounts(q: CallbackQuery):
     async with pool.acquire() as c:
-        rows = await c.fetch("SELECT id,title,hourly_price FROM accounts WHERE active=TRUE ORDER BY id")
+        rows = await c.fetch("""
+            SELECT a.id, a.title,
+                   COALESCE(string_agg(ap.hours || ' soat: ' || ap.price || ' so''m', ', ' ORDER BY ap.hours), '') AS prices
+            FROM accounts a LEFT JOIN account_prices ap ON ap.account_id=a.id
+            WHERE a.active=TRUE GROUP BY a.id ORDER BY a.id
+        """)
     if not rows:
         await q.message.answer("Hozircha bo'sh akkaunt yo'q.")
     else:
         buttons = []
         for a in rows:
-            price = f"{a['hourly_price']:,} so'm/soat" if a["hourly_price"] else "Narx admin tomonidan belgilanadi"
+            price = a["prices"] if a["prices"] else "Narx admin tomonidan belgilanadi"
             buttons.append([InlineKeyboardButton(
                 text=f"{a['title']} — {price}", callback_data=f"account:{a['id']}"
             )])
@@ -90,14 +101,19 @@ async def choose_account(q: CallbackQuery):
     if not a:
         await q.answer("Akkaunt topilmadi.", show_alert=True)
         return
-    if a["hourly_price"] <= 0:
+    async with pool.acquire() as c:
+        prices = await c.fetch(
+            "SELECT hours, price FROM account_prices WHERE account_id=$1 AND price>0 ORDER BY hours",
+            account_id
+        )
+    if not prices:
         await q.answer("Bu akkaunt narxi hali belgilanmagan. Admin bilan bog'laning.", show_alert=True)
         return
-    buttons = [[InlineKeyboardButton(text=f"{h} soat", callback_data=f"duration:{account_id}:{h}")]
-               for h in DURATIONS]
+    buttons = [[InlineKeyboardButton(text=f"{r['hours']} soat — {r['price']:,} so'm",
+                                     callback_data=f"duration:{account_id}:{r['hours']}")]
+               for r in prices]
     await q.message.answer(
-        f"Tanlangan: {a['title']}\nSoatlik narx: {a['hourly_price']:,} so'm\n"
-        "Necha soatga olmoqchisiz?",
+        f"Tanlangan: {a['title']}\nNecha soatga olmoqchisiz?",
         reply_markup=kb(buttons)
     )
     await q.answer()
@@ -108,10 +124,14 @@ async def choose_duration(q: CallbackQuery):
     aid, hours = int(aid), int(hs)
     async with pool.acquire() as c:
         a = await c.fetchrow("SELECT * FROM accounts WHERE id=$1 AND active=TRUE", aid)
-        if not a or a["hourly_price"] <= 0:
-            await q.answer("Narx mavjud emas.", show_alert=True)
+        price = await c.fetchval(
+            "SELECT price FROM account_prices WHERE account_id=$1 AND hours=$2",
+            aid, hours
+        )
+        if not a or price is None or price <= 0:
+            await q.answer("Bu muddat uchun narx belgilanmagan.", show_alert=True)
             return
-        amount = a["hourly_price"] * hours
+        amount = price
         booking_id = await c.fetchval(
             """INSERT INTO bookings(user_id,account_id,hours,amount)
                VALUES($1,$2,$3,$4) RETURNING id""",
@@ -222,21 +242,42 @@ async def start_rental(m: Message):
 
 @dp.message(Command("setprice"))
 async def set_price(m: Message):
-    if m.from_user.id != ADMIN_ID: return
-    parts = m.text.split(maxsplit=2)
-    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-        await m.answer("Foydalanish: /setprice AKKAUNT_ID SOATLIK_NARX"); return
-    aid, price = int(parts[1]), int(parts[2])
+    if m.from_user.id != ADMIN_ID:
+        return
+    parts = m.text.split()
+    if (len(parts) != 4 or not all(x.isdigit() for x in parts[1:])
+            or int(parts[2]) not in DURATIONS):
+        await m.answer(
+            "Foydalanish: /setprice AKKAUNT_ID SOAT NARX\n"
+            "Masalan: /setprice 1 3 150000\n"
+            "24 soat uchun: /setprice 1 24 550000\n"
+            f"Ruxsat etilgan muddatlar: {', '.join(map(str, DURATIONS))} soat"
+        )
+        return
+    aid, hours, price = map(int, parts[1:])
     async with pool.acquire() as c:
-        result = await c.execute("UPDATE accounts SET hourly_price=$1 WHERE id=$2", price, aid)
-    await m.answer("Narx saqlandi." if result.endswith("1") else "Akkaunt ID topilmadi.")
+        exists = await c.fetchval("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)", aid)
+        if exists:
+            await c.execute(
+                """INSERT INTO account_prices(account_id,hours,price) VALUES($1,$2,$3)
+                   ON CONFLICT(account_id,hours) DO UPDATE SET price=EXCLUDED.price""",
+                aid, hours, price
+            )
+    await m.answer(
+        (f"Akkaunt {aid}: {hours} soat = {price:,} so'm saqlandi." if exists else "Akkaunt ID topilmadi.")
+    )
 
 @dp.message(Command("accounts"))
 async def admin_accounts(m: Message):
     if m.from_user.id != ADMIN_ID: return
     async with pool.acquire() as c:
-        rows = await c.fetch("SELECT id,title,hourly_price FROM accounts ORDER BY id")
-    lines = [f"{r['id']}. {r['title']} — {r['hourly_price']:,} so'm/soat" for r in rows]
+        rows = await c.fetch("""
+            SELECT a.id, a.title,
+                   COALESCE(string_agg(ap.hours || ' soat: ' || ap.price || ' so''m', ', ' ORDER BY ap.hours), '') AS prices
+            FROM accounts a LEFT JOIN account_prices ap ON ap.account_id=a.id
+            GROUP BY a.id ORDER BY a.id
+        """)
+    lines = [f"{r['id']}. {r['title']} — {r['prices'] or 'narx belgilanmagan'}" for r in rows]
     await m.answer("\n".join(lines) or "Akkauntlar yo'q.")
 
 async def expiry_watcher():
