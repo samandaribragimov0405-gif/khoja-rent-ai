@@ -46,7 +46,6 @@ class CashbackState(StatesGroup):
 
 
 class AdminState(StatesGroup):
-    waiting_rename = State()
     waiting_price = State()
     waiting_toggle = State()
 
@@ -119,6 +118,10 @@ async def init_db():
 
             ALTER TABLE bookings
             ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+            ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_username TEXT;
+            ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_first_name TEXT;
+            ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_last_name TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_bookings_account_status
             ON bookings(account_id, status, expires_at);
@@ -229,7 +232,7 @@ async def customer_bonus(q: CallbackQuery):
             text=f"🎉 Yutuqni olish ({claimable} ta)",
             callback_data="bonus:claim"
         )])
-    buttons.append([InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
     await q.message.answer(text, reply_markup=kb(buttons))
     await q.answer()
 
@@ -249,7 +252,8 @@ async def cashback_claim_start(q: CallbackQuery, state: FSMContext):
     await state.set_state(CashbackState.waiting_full_name)
     await q.message.answer(
         f"🎉 Siz {reward['amount']:,} so'm cashback yutdingiz!\n\n"
-        "Pulni o'tkazishimiz uchun ism va familiyangizni yuboring."
+        "Pulni o'tkazishimiz uchun ism va familiyangizni yuboring.",
+        reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
     )
     await q.answer()
 
@@ -258,18 +262,18 @@ async def cashback_claim_start(q: CallbackQuery, state: FSMContext):
 async def cashback_receive_name(m: Message, state: FSMContext):
     full_name = " ".join((m.text or "").strip().split())
     if not full_name or len(full_name) < 5 or len(full_name) > 100 or len(full_name.split()) < 2:
-        await m.answer("Iltimos, ism va familiyangizni to'liq yozing. Masalan: Ali Valiyev")
+        await m.answer("Iltimos, ism va familiyangizni to'liq yozing. Masalan: Ali Valiyev", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
         return
     await state.update_data(cashback_full_name=full_name)
     await state.set_state(CashbackState.waiting_card_number)
-    await m.answer("Endi cashback tushiriladigan 16 xonali karta raqamini yuboring.\nCVV, amal qilish muddati yoki SMS-kodni yubormang.")
+    await m.answer("Endi cashback tushiriladigan 16 xonali karta raqamini yuboring.\nCVV, amal qilish muddati yoki SMS-kodni yubormang.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
 
 
 @dp.message(CashbackState.waiting_card_number)
 async def cashback_receive_card(m: Message, state: FSMContext):
     card_number = re.sub(r"[\s-]", "", (m.text or ""))
     if not re.fullmatch(r"\d{16}", card_number):
-        await m.answer("Karta raqami 16 ta raqamdan iborat bo'lishi kerak. Qayta yuboring.")
+        await m.answer("Karta raqami 16 ta raqamdan iborat bo'lishi kerak. Qayta yuboring.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
         return
 
     data = await state.get_data()
@@ -284,7 +288,7 @@ async def cashback_receive_card(m: Message, state: FSMContext):
         """, full_name, card_number, reward_id, m.from_user.id)
 
     if not reward:
-        await m.answer("Bu yutuq allaqachon so'ralgan yoki mavjud emas. BONUS bo'limini yangilang.")
+        await m.answer("Bu yutuq allaqachon so'ralgan yoki mavjud emas. BONUS bo'limini yangilang.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
         await state.clear()
         return
 
@@ -306,7 +310,8 @@ async def cashback_receive_card(m: Message, state: FSMContext):
     )
     await m.answer(
         "✅ Ma'lumotlaringiz adminga yuborildi. "
-        "Cashback kartangizga o'tkazilgach sizga xabar beramiz."
+        "Cashback kartangizga o'tkazilgach sizga xabar beramiz.",
+        reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
     )
     await state.clear()
 
@@ -378,7 +383,7 @@ async def account_list_view():
         else:
             buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
     buttons.append([InlineKeyboardButton(text="🔄 Yangilash", callback_data="accounts")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
     text = "🎮 KHOJA RENT — AKKAUNTLAR\n\n🟢 BO'SH — tanlab buyurtma bering\n🔴 BAND — qolgan vaqt ko'rsatiladi"
     if not rows:
         text += "\n\nHozircha faol akkaunt yo'q."
@@ -406,7 +411,8 @@ async def home(q: CallbackQuery):
     ]
     if q.from_user.id == ADMIN_ID:
         rows.append([InlineKeyboardButton(text="⚙️ Admin paneli", callback_data="admin:panel")])
-    await q.message.answer("Bosh menyu:", reply_markup=kb(rows))
+    await q.message.answer("Asosiy menyu:", reply_markup=kb(rows))
+    await q.message.answer("Pastdagi doimiy menyudan ham foydalanishingiz mumkin.", reply_markup=main_reply_keyboard(q.from_user.id))
     await q.answer()
 
 
@@ -468,6 +474,7 @@ async def choose_account(q: CallbackQuery):
             text=label,
             callback_data=f"duration:{account_id}:{p['hours']}"
         )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
 
     await q.message.answer(
         f"Tanlangan: {a['title']}\nTarifni tanlang:",
@@ -509,10 +516,11 @@ async def choose_duration(q: CallbackQuery):
 
         amount = p["price"]
         booking_id = await c.fetchval("""
-            INSERT INTO bookings(user_id, account_id, hours, amount)
-            VALUES($1, $2, $3, $4)
+            INSERT INTO bookings(user_id, account_id, hours, amount, user_username, user_first_name, user_last_name)
+            VALUES($1, $2, $3, $4, $5, $6, $7)
             RETURNING id
-        """, q.from_user.id, aid, hours, amount)
+        """, q.from_user.id, aid, hours, amount, q.from_user.username,
+             q.from_user.first_name, q.from_user.last_name)
 
     label = tariff_title(hours, amount)
     await q.message.answer(
@@ -522,7 +530,8 @@ async def choose_duration(q: CallbackQuery):
         f"Jami: {amount:,} so'm\n\n"
         f"To'lov kartasi: {CARD_DETAILS}\n\n"
         "To'lovni amalga oshirgach, chek rasmini yuboring. "
-        "To'lov admin tomonidan bank ilovasida tekshiriladi."
+        "To'lov admin tomonidan bank ilovasida tekshiriladi.",
+        reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
     )
     await q.message.answer(
         "Chekni yuborish uchun quyidagi tugmani bosing:",
@@ -531,7 +540,7 @@ async def choose_duration(q: CallbackQuery):
                 text="Chek yuborish",
                 callback_data=f"receipt:{booking_id}"
             )
-        ]])
+        ], [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
     )
     await q.answer()
 
@@ -555,7 +564,7 @@ async def receipt_start(q: CallbackQuery, state: FSMContext):
 
     await state.update_data(booking_id=booking_id)
     await state.set_state(ReceiptState.waiting_receipt)
-    await q.message.answer("To'lov chekini rasm ko'rinishida yuboring.")
+    await q.message.answer("To'lov chekini rasm ko'rinishida yuboring.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
     await q.answer()
 
 
@@ -592,32 +601,31 @@ async def receive_receipt(m: Message, state: FSMContext):
         file_id,
         caption=(
             f"Chek — buyurtma №{booking_id}\n"
+            f"Mijoz: {m.from_user.full_name}\n"
+            f"Username: @{m.from_user.username or 'mavjud emas'}\n"
             f"Mijoz ID: {m.from_user.id}\n"
             f"Akkaunt: {a['title']}\n"
             f"Tarif: {label}\n"
             f"Summa: {b['amount']:,} so'm"
         ),
-        reply_markup=kb([[
-            InlineKeyboardButton(
-                text="To'lov tasdiqlandi",
-                callback_data=f"approve:{booking_id}"
-            ),
-            InlineKeyboardButton(
-                text="Rad etish",
-                callback_data=f"reject:{booking_id}"
-            )
-        ]])
+        reply_markup=kb([
+            [InlineKeyboardButton(text="👤 Mijoz lichkasi", url=(f"https://t.me/{m.from_user.username}" if m.from_user.username else f"tg://user?id={m.from_user.id}"))],
+            [InlineKeyboardButton(text="To'lov tasdiqlandi", callback_data=f"approve:{booking_id}"),
+             InlineKeyboardButton(text="Rad etish", callback_data=f"reject:{booking_id}")],
+            [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
+        ])
     )
 
     await m.answer(
-        "Chek adminga yuborildi. To'lov bank ilovasida tekshirilgach javob beramiz."
+        "Chek adminga yuborildi. To'lov bank ilovasida tekshirilgach javob beramiz.",
+        reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
     )
     await state.clear()
 
 
 @dp.message(ReceiptState.waiting_receipt)
 async def receipt_not_photo(m: Message):
-    await m.answer("Iltimos, chekni rasm ko'rinishida yuboring.")
+    await m.answer("Iltimos, chekni rasm ko'rinishida yuboring.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
 
 
 @dp.callback_query(F.data.startswith("approve:"))
@@ -821,14 +829,12 @@ async def admin_panel(q: CallbackQuery):
     await q.message.answer(
         "⚙️ ADMIN PANELI — amalni tanlang:",
         reply_markup=kb([
-            [InlineKeyboardButton(text="📋 Akkauntlar va narxlar", callback_data="admin:list")],
-            [InlineKeyboardButton(text="✏️ Akkaunt nomini/almashtirish", callback_data="admin:rename")],
             [InlineKeyboardButton(text="💰 Narxni o'zgartirish", callback_data="admin:price")],
             [InlineKeyboardButton(text="🔄 Akkauntni yashirish/ochish", callback_data="admin:toggle")],
             [InlineKeyboardButton(text="🔴 Qo'lda band qilish / bo'shatish", callback_data="admin:manual_blocks")],
             [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")],
             [InlineKeyboardButton(text="🎁 Cashback so'rovlari", callback_data="admin:cashbacks")],
-            [InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")]
+            [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
         ])
     )
     await q.answer()
@@ -849,7 +855,7 @@ async def admin_cashback_requests(q: CallbackQuery):
             LIMIT 30
         """)
     if not rows:
-        await q.message.answer("Hozircha cashback to'lash so'rovlari yo'q.")
+        await q.message.answer("Hozircha cashback to'lash so'rovlari yo'q.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
     else:
         for r in rows:
             await q.message.answer(
@@ -857,43 +863,12 @@ async def admin_cashback_requests(q: CallbackQuery):
                 f"Yutuq ID: {r['id']}\nMijoz ID: {r['user_id']}\n"
                 f"Ism-familiya: {r['full_name']}\nKarta: {r['card_number']}\n"
                 f"Summa: {r['amount']:,} so'm\nBosqich: {r['milestone_number']}",
-                reply_markup=kb([[
-                    InlineKeyboardButton(
-                        text="✅ Cashback to'landi",
-                        callback_data=f"bonus_paid:{r['id']}"
-                    )
-                ]])
+                reply_markup=kb([
+                    [InlineKeyboardButton(text="✅ Cashback to'landi", callback_data=f"bonus_paid:{r['id']}")],
+                    [InlineKeyboardButton(text="👤 Mijoz lichkasiga o'tish", url=f"tg://user?id={r['user_id']}")],
+                    [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
+                ])
             )
-    await q.answer()
-
-
-@dp.callback_query(F.data == "admin:list")
-async def admin_list(q: CallbackQuery):
-    if q.from_user.id != ADMIN_ID:
-        await q.answer("Ruxsat yo'q.", show_alert=True)
-        return
-    async with pool.acquire() as c:
-        rows = await c.fetch("""
-            SELECT a.id, a.title, a.active, p.hours, p.price
-            FROM accounts a LEFT JOIN account_prices p ON p.account_id=a.id
-            ORDER BY a.id, CASE WHEN p.hours=0 THEN 99 ELSE p.hours END
-        """)
-    lines = []
-    for r in rows:
-        state = "🟢 faol" if r["active"] else "⚪ yashirilgan"
-        price = "narx belgilanmagan" if r["hours"] is None else tariff_title(r["hours"], r["price"])
-        lines.append(f"{r['id']}. {r['title']} ({state}) — {price}")
-    await q.message.answer("\n".join(lines) or "Akkauntlar yo'q.")
-    await q.answer()
-
-
-@dp.callback_query(F.data == "admin:rename")
-async def admin_rename_start(q: CallbackQuery, state: FSMContext):
-    if q.from_user.id != ADMIN_ID:
-        await q.answer("Ruxsat yo'q.", show_alert=True)
-        return
-    await state.set_state(AdminState.waiting_rename)
-    await q.message.answer("Akkaunt ID va yangi nomni yuboring.\nMasalan: 1 PUBG VIP")
     await q.answer()
 
 
@@ -903,7 +878,7 @@ async def admin_price_start(q: CallbackQuery, state: FSMContext):
         await q.answer("Ruxsat yo'q.", show_alert=True)
         return
     await state.set_state(AdminState.waiting_price)
-    await q.message.answer("Format: AKKAUNT_ID SOAT NARX\nMasalan: 1 3 150000\nTungi tarifda soat o'rniga 0 yozing.")
+    await q.message.answer("Format: AKKAUNT_ID SOAT NARX\nMasalan: 1 3 150000\nTungi tarifda soat o'rniga 0 yozing.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
     await q.answer()
 
 
@@ -913,7 +888,7 @@ async def admin_toggle_start(q: CallbackQuery, state: FSMContext):
         await q.answer("Ruxsat yo'q.", show_alert=True)
         return
     await state.set_state(AdminState.waiting_toggle)
-    await q.message.answer("Akkaunt ID sini yuboring. Faol akkaunt yashiriladi, yashirilgani qayta ochiladi.")
+    await q.message.answer("Akkaunt ID sini yuboring. Faol akkaunt yashiriladi, yashirilgani qayta ochiladi.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
     await q.answer()
 
 
@@ -940,6 +915,7 @@ async def admin_manual_blocks(q: CallbackQuery):
             action = f"admin:block:{row['id']}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=action)])
     buttons.append([InlineKeyboardButton(text="⬅️ Admin paneli", callback_data="admin:panel")])
+    buttons.append([InlineKeyboardButton(text="🏠 Asosiy menyu", callback_data="home")])
     await q.message.answer(
         "Qo'lda band qilish yoki bo'shatish uchun akkauntni tanlang. "
         "Qo'lda band qilingan akkauntda bo'shash vaqti ko'rsatilmaydi:",
@@ -997,27 +973,53 @@ async def admin_bookings(q: CallbackQuery):
         return
     async with pool.acquire() as c:
         rows = await c.fetch("""
-            SELECT id, account_id, user_id, amount, status
-            FROM bookings ORDER BY id DESC LIMIT 20
+            SELECT b.id, b.account_id, b.user_id, b.hours, b.amount, b.status,
+                   b.created_at, b.user_username, b.user_first_name, b.user_last_name,
+                   a.title
+            FROM bookings b
+            LEFT JOIN accounts a ON a.id=b.account_id
+            ORDER BY b.id DESC LIMIT 30
         """)
-    lines = [f"№{r['id']} | akkaunt {r['account_id']} | mijoz {r['user_id']} | {r['amount']:,} so'm | {r['status']}" for r in rows]
-    await q.message.answer("\n".join(lines) or "Buyurtmalar yo'q.")
+    if not rows:
+        await q.message.answer(
+            "📦 Hozircha buyurtmalar yo'q.",
+            reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
+        )
+    else:
+        for r in rows:
+            full_name = " ".join(x for x in [r["user_first_name"], r["user_last_name"]] if x)
+            username = f"@{r['user_username']}" if r["user_username"] else "username yo'q"
+            customer = full_name or "Ism mavjud emas"
+            hours_label = "Tungi tarif" if r["hours"] == 0 else f"{r['hours']} soat"
+            created = r["created_at"].astimezone(TASHKENT).strftime("%d.%m.%Y %H:%M") if r["created_at"] else "—"
+            status_names = {
+                "awaiting_payment": "To'lov kutilmoqda",
+                "receipt_received": "Chek yuborilgan",
+                "paid": "To'lov tasdiqlangan",
+                "active": "Ijara faol",
+                "expired": "Muddati tugagan",
+                "rejected": "Rad etilgan",
+            }
+            profile_url = f"https://t.me/{r['user_username']}" if r["user_username"] else f"tg://user?id={r['user_id']}"
+            text = (
+                f"📦 BUYURTMA №{r['id']}\n\n"
+                f"👤 Mijoz: {customer}\n"
+                f"🔹 Username: {username}\n"
+                f"🆔 Telegram ID: {r['user_id']}\n"
+                f"🎮 Akkaunt: {r['title'] or ('ID ' + str(r['account_id']))} (#{r['account_id']})\n"
+                f"⏱ Tarif: {hours_label}\n"
+                f"💰 Summa: {r['amount']:,} so'm\n"
+                f"📌 Holat: {status_names.get(r['status'], r['status'])}\n"
+                f"🗓 Buyurtma vaqti: {created}"
+            )
+            await q.message.answer(
+                text,
+                reply_markup=kb([
+                    [InlineKeyboardButton(text="👤 Mijoz lichkasiga o'tish", url=profile_url)],
+                    [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
+                ])
+            )
     await q.answer()
-
-
-@dp.message(AdminState.waiting_rename)
-async def admin_rename_save(m: Message, state: FSMContext):
-    if m.from_user.id != ADMIN_ID:
-        return
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) != 2 or not parts[0].isdigit():
-        await m.answer("Format: 1 PUBG VIP")
-        return
-    async with pool.acquire() as c:
-        result = await c.execute("UPDATE accounts SET title=$1 WHERE id=$2", parts[1].strip(), int(parts[0]))
-    await m.answer("Akkaunt nomi yangilandi." if result.endswith("1") else "Akkaunt ID topilmadi.")
-    await state.clear()
-    await update_account_views()
 
 
 @dp.message(AdminState.waiting_price)
@@ -1026,11 +1028,11 @@ async def admin_price_save(m: Message, state: FSMContext):
         return
     parts = (m.text or "").split()
     if len(parts) != 3 or not all(x.isdigit() for x in parts):
-        await m.answer("Format: 1 3 150000")
+        await m.answer("Format: 1 3 150000", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
         return
     aid, hours, price = map(int, parts)
     if hours not in (0, 3, 6, 12, 24) or price <= 0:
-        await m.answer("Soat 0, 3, 6, 12 yoki 24; narx 0 dan katta bo'lishi kerak.")
+        await m.answer("Soat 0, 3, 6, 12 yoki 24; narx 0 dan katta bo'lishi kerak.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
         return
     async with pool.acquire() as c:
         exists = await c.fetchval("SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)", aid)
@@ -1039,7 +1041,7 @@ async def admin_price_save(m: Message, state: FSMContext):
                 INSERT INTO account_prices(account_id, hours, price) VALUES($1,$2,$3)
                 ON CONFLICT(account_id,hours) DO UPDATE SET price=EXCLUDED.price
             """, aid, hours, price)
-    await m.answer("Narx saqlandi." if exists else "Akkaunt ID topilmadi.")
+    await m.answer("Narx saqlandi." if exists else "Akkaunt ID topilmadi.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
     await state.clear()
 
 
@@ -1088,12 +1090,13 @@ async def reply_menu_bonus(m: Message):
             text=f"🎉 Yutuqni olish ({claimable} ta)",
             callback_data="bonus:claim"
         )])
-    await m.answer(text, reply_markup=kb(buttons) if buttons else None)
+    buttons.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
+    await m.answer(text, reply_markup=kb(buttons))
 
 
 @dp.message(F.text == "💬 Admin bilan aloqa")
 async def reply_menu_contact(m: Message):
-    await m.answer("Admin bilan bog'lanish: https://t.me/khoja_arenda")
+    await m.answer("Admin bilan bog'lanish: https://t.me/khoja_arenda", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
 
 
 @dp.message(F.text == "⚙️ Admin paneli")
@@ -1103,13 +1106,12 @@ async def reply_menu_admin(m: Message):
     await m.answer(
         "⚙️ ADMIN PANELI — amalni tanlang:",
         reply_markup=kb([
-            [InlineKeyboardButton(text="📋 Akkauntlar va narxlar", callback_data="admin:list")],
-            [InlineKeyboardButton(text="✏️ Akkaunt nomini/almashtirish", callback_data="admin:rename")],
             [InlineKeyboardButton(text="💰 Narxni o'zgartirish", callback_data="admin:price")],
             [InlineKeyboardButton(text="🔄 Akkauntni yashirish/ochish", callback_data="admin:toggle")],
             [InlineKeyboardButton(text="🔴 Qo'lda band qilish / bo'shatish", callback_data="admin:manual_blocks")],
             [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")],
             [InlineKeyboardButton(text="🎁 Cashback so'rovlari", callback_data="admin:cashbacks")],
+            [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
         ])
     )
 
