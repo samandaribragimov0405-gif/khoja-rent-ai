@@ -122,6 +122,8 @@ async def init_db():
             ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_username TEXT;
             ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_first_name TEXT;
             ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_last_name TEXT;
+            ALTER TABLE bookings ADD COLUMN IF NOT EXISTS original_amount BIGINT;
+            ALTER TABLE bookings ADD COLUMN IF NOT EXISTS bonus_used BIGINT NOT NULL DEFAULT 0;
 
             CREATE INDEX IF NOT EXISTS idx_bookings_account_status
             ON bookings(account_id, status, expires_at);
@@ -154,6 +156,9 @@ async def init_db():
             ADD COLUMN IF NOT EXISTS requested_at TIMESTAMPTZ;
             ALTER TABLE bonus_rewards
             ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+            ALTER TABLE bonus_rewards ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ;
+            ALTER TABLE bonus_rewards ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
+            ALTER TABLE bookings ADD COLUMN IF NOT EXISTS bonus_reward_id INTEGER REFERENCES bonus_rewards(id);
         """)
 
         count = await c.fetchval("SELECT COUNT(*) FROM accounts")
@@ -197,44 +202,72 @@ async def get_bonus_stats(user_id: int):
             SELECT COUNT(*) FROM bookings
             WHERE user_id=$1 AND status IN ('paid','active','expired')
         """, user_id)
-        pending = await c.fetchval("""
+        available = await c.fetchval("""
             SELECT COALESCE(SUM(amount),0) FROM bonus_rewards
-            WHERE user_id=$1 AND status IN ('pending','requested')
+            WHERE user_id=$1 AND status='pending'
+        """, user_id)
+        requested = await c.fetchval("""
+            SELECT COALESCE(SUM(amount),0) FROM bonus_rewards
+            WHERE user_id=$1 AND status='requested'
+        """, user_id)
+        reserved = await c.fetchval("""
+            SELECT COALESCE(SUM(amount),0) FROM bonus_rewards
+            WHERE user_id=$1 AND status='reserved'
         """, user_id)
         paid = await c.fetchval("""
             SELECT COALESCE(SUM(amount),0) FROM bonus_rewards
             WHERE user_id=$1 AND status='paid'
         """, user_id)
+        used = await c.fetchval("""
+            SELECT COALESCE(SUM(amount),0) FROM bonus_rewards
+            WHERE user_id=$1 AND status='redeemed'
+        """, user_id)
         claimable = await c.fetchval("""
             SELECT COUNT(*) FROM bonus_rewards
             WHERE user_id=$1 AND status='pending'
         """, user_id)
-    return int(total or 0), int(pending or 0), int(paid or 0), int(claimable or 0)
+    return tuple(int(v or 0) for v in (total, available, requested, reserved, paid, used, claimable))
 
 
-@dp.callback_query(F.data == "bonus")
-async def customer_bonus(q: CallbackQuery):
-    total, pending, paid, claimable = await get_bonus_stats(q.from_user.id)
+async def bonus_screen(user_id: int):
+    total, available, requested, reserved, paid, used, claimable = await get_bonus_stats(user_id)
     progress = total % 10
     remaining = 10 - progress if progress else 10
     text = (
-        "🎁 KHOJA RENT BONUS\n\n"
-        f"Jami tasdiqlangan ijaralar: {total} ta\n"
-        f"Keyingi yutuq uchun: {progress}/10 ta\n"
-        f"Yana kerak: {remaining} ta\n"
-        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\n\n"
-        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\n"
-        f"Oldin to'langan cashback: {paid:,} so'm"
+        f"🎁 KHOJA RENT BONUS\n\n"
+        f"📊 Jami tasdiqlangan ijaralar: {total} ta\n"
+        f"🎯 Keyingi bonusgacha: {progress}/10 ta\n"
+        f"🔥 Yana kerak: {remaining} ta ({progress * 10}%)\n\n"
+        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm bonus!\n\n"
+        f"💰 Mavjud bonus: {available:,} so'm\n"
+        f"⏳ Kartaga o'tkazish so'rovi: {requested:,} so'm\n"
+        f"🛒 Buyurtmada band qilingan bonus: {reserved:,} so'm\n"
+        f"🎮 Akkauntga ishlatilgan bonus: {used:,} so'm\n"
+        f"✅ Oldin kartaga to'langan: {paid:,} so'm"
     )
     buttons = []
     if claimable:
         buttons.append([InlineKeyboardButton(
-            text=f"🎉 Yutuqni olish ({claimable} ta)",
+            text=f"💳 Kartaga o'tkazish ({claimable} ta yutuq)",
             callback_data="bonus:claim"
         )])
+        buttons.append([InlineKeyboardButton(
+            text="🎮 Yutuqqa akkaunt olish",
+            callback_data="bonus:account"
+        )])
+    else:
+        text += "\n\nHozircha ishlatish mumkin bo'lgan bonus yo'q. 10 ta tasdiqlangan ijaraga yetganda bonus beriladi."
     buttons.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
-    await q.message.answer(text, reply_markup=kb(buttons))
+    return text, kb(buttons)
+
+
+
+@dp.callback_query(F.data == "bonus")
+async def customer_bonus(q: CallbackQuery):
+    text, markup = await bonus_screen(q.from_user.id)
+    await q.message.answer(text, reply_markup=markup)
     await q.answer()
+
 
 
 @dp.callback_query(F.data == "bonus:claim")
@@ -305,6 +338,10 @@ async def cashback_receive_card(m: Message, state: FSMContext):
             InlineKeyboardButton(
                 text="✅ Cashback to'landi",
                 callback_data=f"bonus_paid:{reward['id']}"
+            ),
+            InlineKeyboardButton(
+                text="❌ So'rovni rad etish",
+                callback_data=f"bonus_reject:{reward['id']}"
             )
         ]])
     )
@@ -338,6 +375,250 @@ async def cashback_mark_paid(q: CallbackQuery):
     )
     await q.message.edit_text((q.message.text or "") + "\n\n✅ CASHBACK TO'LANDI")
     await q.answer("To'lov belgilandi.")
+
+
+@dp.callback_query(F.data == "bonus:account")
+async def bonus_account_start(q: CallbackQuery):
+    async with pool.acquire() as c:
+        reward = await c.fetchrow("""
+            SELECT id, amount FROM bonus_rewards
+            WHERE user_id=$1 AND status='pending'
+            ORDER BY milestone_number LIMIT 1
+        """, q.from_user.id)
+        accounts = await c.fetch("""
+            SELECT a.id, a.title FROM accounts a
+            WHERE a.active=TRUE
+              AND NOT EXISTS (SELECT 1 FROM manual_account_blocks mb WHERE mb.account_id=a.id)
+              AND NOT EXISTS (
+                  SELECT 1 FROM bookings b
+                  WHERE b.account_id=a.id AND b.status IN ('paid','active')
+                    AND (b.status='paid' OR b.expires_at > NOW())
+              )
+            ORDER BY a.id
+        """)
+    if not reward:
+        await q.answer("Ishlatish mumkin bo'lgan bonus topilmadi.", show_alert=True)
+        return
+    if not accounts:
+        await q.answer("Hozircha bo'sh akkaunt yo'q. Keyinroq urinib ko'ring.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(
+        text=f"🟢 {a['id']} AKKAUNT — BO'SH",
+        callback_data=f"bonus:pickacc:{reward['id']}:{a['id']}"
+    )] for a in accounts]
+    buttons += [
+        [InlineKeyboardButton(text="⬅️ BONUSGA QAYTISH", callback_data="bonus")],
+        [InlineKeyboardButton(text="🏠 ASOSIY MENYU", callback_data="home")]
+    ]
+    await q.message.answer(
+        f"🎮 BONUS ORQALI AKKAUNT OLISH\n"
+        f"Bonus balansingiz: {reward['amount']:,} so'm\n\n"
+        "Ijaraga olmoqchi bo'lgan bo'sh akkauntni tanlang:",
+        reply_markup=kb(buttons)
+    )
+    await q.answer()
+
+
+@dp.callback_query(F.data.startswith("bonus:pickacc:"))
+async def bonus_pick_account(q: CallbackQuery):
+    _, _, reward_id_text, account_id_text = q.data.split(":")
+    reward_id, account_id = int(reward_id_text), int(account_id_text)
+    async with pool.acquire() as c:
+        reward = await c.fetchrow("""
+            SELECT amount FROM bonus_rewards
+            WHERE id=$1 AND user_id=$2 AND status='pending'
+        """, reward_id, q.from_user.id)
+        account = await c.fetchrow(
+            "SELECT id, title FROM accounts WHERE id=$1 AND active=TRUE", account_id
+        )
+        busy = await c.fetchval("""
+            SELECT (
+                EXISTS(SELECT 1 FROM manual_account_blocks WHERE account_id=$1)
+                OR EXISTS(SELECT 1 FROM bookings
+                          WHERE account_id=$1 AND status IN ('paid','active')
+                            AND (status='paid' OR expires_at > NOW()))
+            )
+        """, account_id)
+        prices = await c.fetch("""
+            SELECT hours, price FROM account_prices
+            WHERE account_id=$1 AND price > 0
+            ORDER BY CASE WHEN hours=0 THEN 99 ELSE hours END
+        """, account_id)
+    if not reward:
+        await q.answer("Bu bonus allaqachon ishlatilgan yoki mavjud emas.", show_alert=True)
+        return
+    if not account or busy:
+        await q.answer("Bu akkaunt band bo'lib qoldi. Boshqasini tanlang.", show_alert=True)
+        return
+    if not prices:
+        await q.answer("Bu akkaunt uchun tarif belgilanmagan.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(
+        text=tariff_title(p["hours"], p["price"]),
+        callback_data=f"bonus:picktariff:{reward_id}:{account_id}:{p['hours']}"
+    )] for p in prices]
+    buttons += [
+        [InlineKeyboardButton(text="⬅️ AKKAUNTLARGA QAYTISH", callback_data="bonus:account")],
+        [InlineKeyboardButton(text="🏠 ASOSIY MENYU", callback_data="home")]
+    ]
+    await q.message.answer(
+        f"🎮 {account['title']}\nBonus balansingiz: {reward['amount']:,} so'm\nTarifni tanlang:",
+        reply_markup=kb(buttons)
+    )
+    await q.answer()
+
+
+@dp.callback_query(F.data.startswith("bonus:picktariff:"))
+async def bonus_pick_tariff(q: CallbackQuery):
+    _, _, reward_id_text, account_id_text, hours_text = q.data.split(":")
+    reward_id, account_id, hours = int(reward_id_text), int(account_id_text), int(hours_text)
+    async with pool.acquire() as c:
+        async with c.transaction():
+            account = await c.fetchrow(
+                "SELECT id, title FROM accounts WHERE id=$1 AND active=TRUE FOR UPDATE",
+                account_id
+            )
+            reward = await c.fetchrow("""
+                SELECT id, amount FROM bonus_rewards
+                WHERE id=$1 AND user_id=$2 AND status='pending' FOR UPDATE
+            """, reward_id, q.from_user.id)
+            price = await c.fetchrow("""
+                SELECT price FROM account_prices
+                WHERE account_id=$1 AND hours=$2 AND price > 0
+            """, account_id, hours)
+            busy = await c.fetchval("""
+                SELECT (
+                    EXISTS(SELECT 1 FROM manual_account_blocks WHERE account_id=$1)
+                    OR EXISTS(SELECT 1 FROM bookings
+                              WHERE account_id=$1 AND status IN ('paid','active')
+                                AND (status='paid' OR expires_at > NOW()))
+                )
+            """, account_id)
+            if not account or not reward or not price or busy:
+                await q.answer("Akkaunt, tarif yoki bonus endi mavjud emas. Qaytadan tanlang.", show_alert=True)
+                return
+            original_amount = int(price["price"])
+            bonus_used = min(int(reward["amount"]), original_amount)
+            due = original_amount - bonus_used
+            status = "paid" if due == 0 else "awaiting_payment"
+            booking_id = await c.fetchval("""
+                INSERT INTO bookings(
+                    user_id, account_id, hours, amount, status,
+                    user_username, user_first_name, user_last_name,
+                    original_amount, bonus_used, bonus_reward_id
+                )
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                RETURNING id
+            """, q.from_user.id, account_id, hours, due, status,
+                 q.from_user.username, q.from_user.first_name, q.from_user.last_name,
+                 original_amount, bonus_used, reward_id)
+            if due == 0:
+                await c.execute("""
+                    UPDATE bonus_rewards SET status='redeemed', used_at=NOW()
+                    WHERE id=$1 AND status='pending'
+                """, reward_id)
+                approved_count = await c.fetchval("""
+                    SELECT COUNT(*) FROM bookings
+                    WHERE user_id=$1 AND status IN ('paid','active','expired')
+                """, q.from_user.id)
+                if approved_count and approved_count % 10 == 0:
+                    await c.execute("""
+                        INSERT INTO bonus_rewards(user_id, milestone_number, amount, status)
+                        VALUES($1,$2,100000,'pending')
+                        ON CONFLICT(user_id,milestone_number) DO NOTHING
+                    """, q.from_user.id, approved_count // 10)
+            else:
+                await c.execute("""
+                    UPDATE bonus_rewards SET status='reserved', reserved_at=NOW()
+                    WHERE id=$1 AND status='pending'
+                """, reward_id)
+
+    label = tariff_title(hours, original_amount)
+    if due == 0:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🎮 BONUS AKKAUNT BUYURTMASI №{booking_id}\n"
+            f"Mijoz: {q.from_user.full_name} (@{q.from_user.username or 'username yo‘q'})\n"
+            f"Telegram ID: {q.from_user.id}\nAkkaunt: {account['title']} (#{account_id})\n"
+            f"Tarif: {label}\nBonus ishlatildi: {bonus_used:,} so'm\n"
+            "To'lov: 0 so'm — bonus to'liq qopladi.\n"
+            f"Ijarani boshlash: /start_rental {booking_id}",
+            reply_markup=kb([[
+                InlineKeyboardButton(text="👤 Mijoz lichkasiga o'tish", url=f"tg://user?id={q.from_user.id}")
+            ], [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")]])
+        )
+        await q.message.answer(
+            f"🎉 Buyurtmangiz qabul qilindi!\nAkkaunt: {account['title']}\nTarif: {label}\n"
+            f"Bonus ishlatildi: {bonus_used:,} so'm\nQo'shimcha to'lov: 0 so'm.\n"
+            "Admin ijarani ishga tushirgach sizga xabar beramiz.",
+            reply_markup=kb([[InlineKeyboardButton(text="⬅️ ASOSIY MENYU", callback_data="home")]])
+        )
+    else:
+        await q.message.answer(
+            f"🧾 BUYURTMA №{booking_id}\nAkkaunt: {account['title']}\nTarif: {label}\n"
+            f"Ijara narxi: {original_amount:,} so'm\nBonus chegirmasi: -{bonus_used:,} so'm\n"
+            f"Qolgan to'lov: {due:,} so'm\n\nTo'lov kartasi: {CARD_DETAILS}\n"
+            "Qolgan summani to'lang va chekni yuboring. Admin tasdiqlagach bonus ishlatiladi.",
+            reply_markup=kb([
+                [InlineKeyboardButton(text="📸 Chek yuborish", callback_data=f"receipt:{booking_id}")],
+                [InlineKeyboardButton(text="❌ Buyurtmani bekor qilish", callback_data=f"bonus_cancel:{booking_id}")],
+                [InlineKeyboardButton(text="⬅️ ASOSIY MENYU", callback_data="home")]
+            ])
+        )
+    await q.answer("Buyurtma yaratildi.")
+
+
+@dp.callback_query(F.data.startswith("bonus_reject:"))
+async def cashback_reject(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    reward_id = int(q.data.split(":")[1])
+    async with pool.acquire() as c:
+        reward = await c.fetchrow("""
+            UPDATE bonus_rewards
+            SET status='pending', full_name=NULL, card_number=NULL, requested_at=NULL
+            WHERE id=$1 AND status='requested'
+            RETURNING user_id, amount
+        """, reward_id)
+    if not reward:
+        await q.answer("So'rov topilmadi yoki holati o'zgargan.", show_alert=True)
+        return
+    await bot.send_message(
+        reward["user_id"],
+        f"Cashback so'rovingiz rad etildi. {reward['amount']:,} so'm bonusingiz balansga qaytarildi."
+    )
+    await q.message.edit_text((q.message.text or "") + "\n\n❌ SO'ROV RAD ETILDI")
+    await q.answer("Bonus mijoz balansiga qaytarildi.")
+
+
+@dp.callback_query(F.data.startswith("bonus_cancel:"))
+async def bonus_booking_cancel(q: CallbackQuery):
+    booking_id = int(q.data.split(":")[1])
+    async with pool.acquire() as c:
+        async with c.transaction():
+            booking = await c.fetchrow("""
+                SELECT id, bonus_reward_id FROM bookings
+                WHERE id=$1 AND user_id=$2 AND status='awaiting_payment'
+                FOR UPDATE
+            """, booking_id, q.from_user.id)
+            if not booking:
+                await q.answer("Buyurtma topilmadi yoki bekor qilib bo'lmaydi.", show_alert=True)
+                return
+            await c.execute(
+                "UPDATE bookings SET status='rejected' WHERE id=$1",
+                booking_id
+            )
+            if booking["bonus_reward_id"] is not None:
+                await c.execute("""
+                    UPDATE bonus_rewards SET status='pending', reserved_at=NULL
+                    WHERE id=$1 AND status='reserved'
+                """, booking["bonus_reward_id"])
+    await q.message.answer(
+        "Buyurtma bekor qilindi. Ishlatilmagan bonus balansingizga qaytarildi.",
+        reply_markup=kb([[InlineKeyboardButton(text="⬅️ ASOSIY MENYU", callback_data="home")]])
+    )
+    await q.answer("Buyurtma bekor qilindi.")
 
 
 async def account_list_view():
@@ -606,7 +887,9 @@ async def receive_receipt(m: Message, state: FSMContext):
             f"Mijoz ID: {m.from_user.id}\n"
             f"Akkaunt: {a['title']}\n"
             f"Tarif: {label}\n"
-            f"Summa: {b['amount']:,} so'm"
+            f"To'lanadigan summa: {b['amount']:,} so'm\n"
+            + (f"Ijara narxi: {b['original_amount']:,} so'm\nBonus chegirmasi: {b['bonus_used']:,} so'm"
+               if b["bonus_used"] else "")
         ),
         reply_markup=kb([
             [InlineKeyboardButton(text="👤 Mijoz lichkasi", url=(f"https://t.me/{m.from_user.username}" if m.from_user.username else f"tg://user?id={m.from_user.id}"))],
@@ -647,6 +930,11 @@ async def approve(q: CallbackQuery):
             "UPDATE bookings SET status='paid' WHERE id=$1",
             bid
         )
+        if b["bonus_reward_id"] is not None:
+            await c.execute("""
+                UPDATE bonus_rewards SET status='redeemed', used_at=NOW()
+                WHERE id=$1 AND status='reserved'
+            """, b["bonus_reward_id"])
         approved_count = await c.fetchval("""
             SELECT COUNT(*) FROM bookings
             WHERE user_id=$1 AND status IN ('paid','active','expired')
@@ -692,6 +980,11 @@ async def reject(q: CallbackQuery):
             "UPDATE bookings SET status='rejected' WHERE id=$1",
             bid
         )
+        if b["bonus_reward_id"] is not None:
+            await c.execute("""
+                UPDATE bonus_rewards SET status='pending', reserved_at=NULL
+                WHERE id=$1 AND status='reserved'
+            """, b["bonus_reward_id"])
 
     await bot.send_message(
         b["user_id"],
@@ -865,6 +1158,7 @@ async def admin_cashback_requests(q: CallbackQuery):
                 f"Summa: {r['amount']:,} so'm\nBosqich: {r['milestone_number']}",
                 reply_markup=kb([
                     [InlineKeyboardButton(text="✅ Cashback to'landi", callback_data=f"bonus_paid:{r['id']}")],
+                    [InlineKeyboardButton(text="❌ So'rovni rad etish", callback_data=f"bonus_reject:{r['id']}")],
                     [InlineKeyboardButton(text="👤 Mijoz lichkasiga o'tish", url=f"tg://user?id={r['user_id']}")],
                     [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
                 ])
@@ -975,7 +1269,7 @@ async def admin_bookings(q: CallbackQuery):
         rows = await c.fetch("""
             SELECT b.id, b.account_id, b.user_id, b.hours, b.amount, b.status,
                    b.created_at, b.user_username, b.user_first_name, b.user_last_name,
-                   a.title
+                   b.original_amount, b.bonus_used, a.title
             FROM bookings b
             LEFT JOIN accounts a ON a.id=b.account_id
             ORDER BY b.id DESC LIMIT 30
@@ -1008,8 +1302,10 @@ async def admin_bookings(q: CallbackQuery):
                 f"🆔 Telegram ID: {r['user_id']}\n"
                 f"🎮 Akkaunt: {r['title'] or ('ID ' + str(r['account_id']))} (#{r['account_id']})\n"
                 f"⏱ Tarif: {hours_label}\n"
-                f"💰 Summa: {r['amount']:,} so'm\n"
-                f"📌 Holat: {status_names.get(r['status'], r['status'])}\n"
+                f"💰 To'lov: {r['amount']:,} so'm\n"
+                + (f"🎁 Bonus chegirmasi: {r['bonus_used']:,} so'm\n" if r["bonus_used"] else "")
+                + (f"🧾 Asl narx: {r['original_amount']:,} so'm\n" if r["original_amount"] else "")
+                + f"📌 Holat: {status_names.get(r['status'], r['status'])}\n"
                 f"🗓 Buyurtma vaqti: {created}"
             )
             await q.message.answer(
@@ -1072,26 +1368,9 @@ async def reply_menu_accounts(m: Message):
 
 @dp.message(F.text == "🎁 BONUS")
 async def reply_menu_bonus(m: Message):
-    total, pending, paid, claimable = await get_bonus_stats(m.from_user.id)
-    progress = total % 10
-    remaining = 10 - progress if progress else 10
-    text = (
-        "🎁 KHOJA RENT BONUS\\n\\n"
-        f"Jami tasdiqlangan ijaralar: {total} ta\\n"
-        f"Keyingi yutuq uchun: {progress}/10 ta\\n"
-        f"Yana kerak: {remaining} ta\\n"
-        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\\n\\n"
-        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\\n"
-        f"Oldin to'langan cashback: {paid:,} so'm"
-    )
-    buttons = []
-    if claimable:
-        buttons.append([InlineKeyboardButton(
-            text=f"🎉 Yutuqni olish ({claimable} ta)",
-            callback_data="bonus:claim"
-        )])
-    buttons.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
-    await m.answer(text, reply_markup=kb(buttons))
+    text, markup = await bonus_screen(m.from_user.id)
+    await m.answer(text, reply_markup=markup)
+
 
 
 @dp.message(F.text == "💬 Admin bilan aloqa")
