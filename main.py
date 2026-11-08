@@ -68,7 +68,7 @@ def kb(rows):
 def main_reply_keyboard(user_id: int):
     rows = [
         [KeyboardButton(text="🎮 Akkauntlar"), KeyboardButton(text="🎁 BONUS")],
-        [KeyboardButton(text="💬 Admin bilan aloqa")],
+        [KeyboardButton(text="💬 Admin bilan aloqa"), KeyboardButton(text="📜 Qoidalar")],
     ]
     if user_id == ADMIN_ID:
         rows.append([KeyboardButton(text="⚙️ Admin paneli")])
@@ -683,20 +683,15 @@ async def home(q: CallbackQuery, state: FSMContext):
                             pending_booking["bonus_reward_id"]
                         )
         await state.clear()
-    # Eski inline menyu/xabarni olib tashlaymiz: asosiy menyu faqat pastdagi
-    # doimiy ReplyKeyboard panelida qoladi.
-    try:
-        await q.message.delete()
-    except Exception:
-        try:
-            await q.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-    await q.message.answer(
-        "Asosiy menyu. Kerakli bo'limni pastdagi doimiy paneldan tanlang.",
-        reply_markup=main_reply_keyboard(q.from_user.id)
-    )
+    rows = [
+        [InlineKeyboardButton(text="🎮 Akkauntlar", callback_data="accounts")],
+        [InlineKeyboardButton(text="🎁 BONUS", callback_data="bonus")],
+        [InlineKeyboardButton(text="💬 Admin bilan aloqa", url="https://t.me/khoja_arenda")]
+    ]
+    if q.from_user.id == ADMIN_ID:
+        rows.append([InlineKeyboardButton(text="⚙️ Admin paneli", callback_data="admin:panel")])
+    await q.message.answer("Asosiy menyu:", reply_markup=kb(rows))
+    await q.message.answer("Pastdagi doimiy menyudan ham foydalanishingiz mumkin.", reply_markup=main_reply_keyboard(q.from_user.id))
     await q.answer()
 
 
@@ -1001,6 +996,35 @@ async def kyc_finish(m: Message, state: FSMContext, video_id=None, video_note_id
         reply_markup=main_reply_keyboard(m.from_user.id)
     )
     await state.clear()
+
+
+@dp.message(KYCState, F.text == "⬅️ Asosiy menyu")
+async def kyc_reply_home(m: Message, state: FSMContext):
+    data = await state.get_data()
+    bid = data.get("kyc_booking_id")
+    if bid:
+        async with pool.acquire() as c:
+            async with c.transaction():
+                pending_booking = await c.fetchrow(
+                    "SELECT bonus_reward_id FROM bookings "
+                    "WHERE id=$1 AND user_id=$2 AND status='awaiting_verification' FOR UPDATE",
+                    bid, m.from_user.id
+                )
+                if pending_booking:
+                    await c.execute(
+                        "UPDATE bookings SET status='rejected' WHERE id=$1", bid
+                    )
+                    if pending_booking["bonus_reward_id"] is not None:
+                        await c.execute(
+                            "UPDATE bonus_rewards SET status='pending', reserved_at=NULL "
+                            "WHERE id=$1 AND status='reserved'",
+                            pending_booking["bonus_reward_id"]
+                        )
+    await state.clear()
+    await m.answer(
+        "⬅️ Asosiy menyuga qaytdingiz. Kerakli bo'limni pastdagi paneldan tanlang.",
+        reply_markup=main_reply_keyboard(m.from_user.id)
+    )
 
 
 @dp.message(KYCState.waiting_video, F.video)
@@ -1701,6 +1725,16 @@ async def reply_menu_bonus(m: Message):
 @dp.message(F.text == "💬 Admin bilan aloqa")
 async def reply_menu_contact(m: Message):
     await m.answer("Admin bilan bog'lanish: https://t.me/khoja_arenda", reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]]))
+
+
+@dp.message(F.text == "📜 Qoidalar")
+async def reply_menu_rules(m: Message):
+    await m.answer(
+        "📜 KHOJA RENT foydalanish qoidalari bilan quyidagi Telegram kanalida tanishing:",
+        reply_markup=kb([
+            [InlineKeyboardButton(text="📜 Qoidalarni ochish", url="https://t.me/KHOJA_QOIDALAR")]
+        ])
+    )
 
 
 @dp.message(F.text == "⚙️ Admin paneli")
