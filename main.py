@@ -205,8 +205,18 @@ async def init_db():
             """, hours, price)
 
 
+async def reset_user_flow(user_id: int, state: FSMContext):
+    """Clear unfinished conversation state; return a reserved KYC bonus once."""
+    data = await state.get_data()
+    booking_id = data.get("kyc_booking_id")
+    if booking_id:
+        await cancel_pending_kyc(user_id, booking_id)
+    await state.clear()
+
+
 @dp.message(Command("menu"))
-async def show_menu(m: Message):
+async def show_menu(m: Message, state: FSMContext):
+    await reset_user_flow(m.from_user.id, state)
     await m.answer(
         "Asosiy menyu:",
         reply_markup=main_reply_keyboard(m.from_user.id)
@@ -214,7 +224,8 @@ async def show_menu(m: Message):
 
 
 @dp.message(Command("start"))
-async def start(m: Message):
+async def start(m: Message, state: FSMContext):
+    await reset_user_flow(m.from_user.id, state)
     await m.answer(
         "Assalomu alaykum! KHOJA RENT AI botiga xush kelibsiz.\\n"
         "Pastdagi menyudan kerakli bo'limni tanlang:",
@@ -882,6 +893,38 @@ async def cancel_current_flow(m: Message, state: FSMContext):
     else:
         await state.clear()
         await m.answer("Joriy jarayon bekor qilindi.", reply_markup=main_reply_keyboard(m.from_user.id))
+
+
+@dp.message(
+    KYCState,
+    F.text.in_({
+        "🎮 Akkauntlar", "🎁 BONUS", "💬 Admin bilan aloqa",
+        "📜 Qoidalar", "🧾 Qoidalar", "⚙️ Admin paneli",
+        "⬅️ Asosiy menyu"
+    })
+)
+async def kyc_main_menu_navigation(m: Message, state: FSMContext):
+    await reset_user_flow(m.from_user.id, state)
+
+    # Reuse the normal menu handlers after clearing the stuck KYC state.
+    if m.text == "🎮 Akkauntlar":
+        text, markup = await account_list_view()
+        msg = await m.answer(text, reply_markup=markup)
+        account_views.add((msg.chat.id, msg.message_id))
+    elif m.text == "🎁 BONUS":
+        text, markup = await bonus_screen(m.from_user.id)
+        await m.answer(text, reply_markup=markup)
+    elif m.text == "💬 Admin bilan aloqa":
+        await reply_menu_contact(m)
+    elif m.text in ("📜 Qoidalar", "🧾 Qoidalar"):
+        await reply_menu_rules(m)
+    elif m.text == "⚙️ Admin paneli":
+        await reply_menu_admin(m)
+    else:
+        await m.answer(
+            "⬅️ Asosiy menyuga qaytdingiz. Kerakli bo'limni pastdagi paneldan tanlang.",
+            reply_markup=main_reply_keyboard(m.from_user.id)
+        )
 
 
 @dp.message(KYCState, F.text == "⬅️ Asosiy menyu")
