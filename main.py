@@ -784,7 +784,53 @@ async def accounts(q: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("account_busy:"))
 async def account_busy(q: CallbackQuery):
-    await q.answer("Bu akkaunt hozir band. Bo'shashigacha qolgan vaqtni kuzating.", show_alert=True)
+    account_id = int(q.data.split(":", 1)[1])
+    async with pool.acquire() as c:
+        row = await c.fetchrow("""
+            SELECT b.status, b.expires_at,
+                   EXISTS(SELECT 1 FROM manual_account_blocks mb
+                          WHERE mb.account_id=$1) AS manually_blocked
+            FROM accounts a
+            LEFT JOIN LATERAL (
+                SELECT status, expires_at
+                FROM bookings
+                WHERE account_id=a.id
+                  AND status IN ('active','paid','awaiting_verification')
+                ORDER BY CASE
+                    WHEN status='active' AND expires_at IS NOT NULL THEN 0
+                    WHEN status='paid' THEN 1
+                    ELSE 2 END,
+                    created_at DESC
+                LIMIT 1
+            ) b ON TRUE
+            WHERE a.id=$1
+        """, account_id)
+
+    if not row:
+        await q.answer("Akkaunt topilmadi.", show_alert=True)
+        return
+
+    # Faqat amalda boshlangan ijara uchun bo'shash vaqtini ko'rsatamiz.
+    expires_at = row["expires_at"]
+    if row["status"] == "active" and expires_at:
+        remaining = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+        if remaining > 0:
+            hh, rem = divmod(remaining, 3600)
+            mm, ss = divmod(rem, 60)
+            end_time = expires_at.astimezone(TASHKENT).strftime("%H:%M")
+            await q.answer(
+                f"🔴 AKKAUNT BAND\nBo'shash vaqti: {end_time}\nQolgan vaqt: {hh:02d}:{mm:02d}:{ss:02d}",
+                show_alert=True
+            )
+            return
+
+    if row["manually_blocked"]:
+        message = "🔴 AKKAUNT ADMIN TOMONIDAN QO'LDA BAND QILINGAN."
+    elif row["status"] in ("paid", "awaiting_verification"):
+        message = "🔴 AKKAUNT BAND. Ijara hali boshlanmagan, bo'shash vaqti belgilanmagan."
+    else:
+        message = "🔴 AKKAUNT HOZIR BAND. Bo'shash vaqtini aniqlab bo'lmadi."
+    await q.answer(message, show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("account:"))
