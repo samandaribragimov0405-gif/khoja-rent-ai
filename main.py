@@ -683,15 +683,20 @@ async def home(q: CallbackQuery, state: FSMContext):
                             pending_booking["bonus_reward_id"]
                         )
         await state.clear()
-    rows = [
-        [InlineKeyboardButton(text="🎮 Akkauntlar", callback_data="accounts")],
-        [InlineKeyboardButton(text="🎁 BONUS", callback_data="bonus")],
-        [InlineKeyboardButton(text="💬 Admin bilan aloqa", url="https://t.me/khoja_arenda")]
-    ]
-    if q.from_user.id == ADMIN_ID:
-        rows.append([InlineKeyboardButton(text="⚙️ Admin paneli", callback_data="admin:panel")])
-    await q.message.answer("Asosiy menyu:", reply_markup=kb(rows))
-    await q.message.answer("Pastdagi doimiy menyudan ham foydalanishingiz mumkin.", reply_markup=main_reply_keyboard(q.from_user.id))
+    # Eski inline menyu/xabarni olib tashlaymiz: asosiy menyu faqat pastdagi
+    # doimiy ReplyKeyboard panelida qoladi.
+    try:
+        await q.message.delete()
+    except Exception:
+        try:
+            await q.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    await q.message.answer(
+        "Asosiy menyu. Kerakli bo'limni pastdagi doimiy paneldan tanlang.",
+        reply_markup=main_reply_keyboard(q.from_user.id)
+    )
     await q.answer()
 
 
