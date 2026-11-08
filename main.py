@@ -673,15 +673,16 @@ async def account_list_view():
                 buttons.append([InlineKeyboardButton(text=label[:60], callback_data=f"account_busy:{a['id']}")])
             else:
                 buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
-        elif status == "awaiting_verification":
-            buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🔴 BAND (tekshiruvda)", callback_data=f"account_busy:{a['id']}")])
-        elif status == "paid":
-            buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🔴 BAND (ishga tushishi kutilmoqda)", callback_data=f"account_busy:{a['id']}")])
+        elif status in ("awaiting_verification", "paid"):
+            buttons.append([InlineKeyboardButton(
+                text=f"{a['id']} AKKAUNT — 🔴 BAND",
+                callback_data=f"account_busy:{a['id']}"
+            )])
         else:
             buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
     buttons.append([InlineKeyboardButton(text="🔄 Yangilash", callback_data="accounts")])
     buttons.append([InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")])
-    text = "🎮 KHOJA RENT — AKKAUNTLAR\n\n🟢 BO'SH — tanlab buyurtma bering\n🔴 BAND — qolgan vaqt ko'rsatiladi"
+    text = "🎮 KHOJA RENT — AKKAUNTLAR"
     if not rows:
         text += "\n\nHozircha faol akkaunt yo'q."
     return text, kb(buttons)
@@ -1872,7 +1873,7 @@ async def expiry_watcher():
             print("Expiry watcher error:", repr(e))
 
         await update_account_views()
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
 
 
 async def main():
