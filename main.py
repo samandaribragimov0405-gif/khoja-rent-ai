@@ -123,6 +123,12 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_bookings_account_status
             ON bookings(account_id, status, expires_at);
 
+            CREATE TABLE IF NOT EXISTS manual_account_blocks(
+                account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                admin_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
             CREATE TABLE IF NOT EXISTS bonus_rewards(
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -338,7 +344,11 @@ async def account_list_view():
                     ORDER BY b.created_at DESC LIMIT 1) AS booking_status,
                    (SELECT b.expires_at FROM bookings b
                     WHERE b.account_id=a.id AND b.status='active'
-                    ORDER BY b.created_at DESC LIMIT 1) AS expires_at
+                    ORDER BY b.created_at DESC LIMIT 1) AS expires_at,
+                   EXISTS(
+                       SELECT 1 FROM manual_account_blocks mb
+                       WHERE mb.account_id=a.id
+                   ) AS manually_blocked
             FROM accounts a
             WHERE a.active=TRUE
             ORDER BY a.id
@@ -347,7 +357,14 @@ async def account_list_view():
     now = datetime.now(timezone.utc)
     for a in rows:
         status = a["booking_status"]
-        if status == "active" and a["expires_at"]:
+        # Admin qo'lda band qilgan akkaunt: doim qizil, vaqt ko'rsatilmaydi.
+        if a["manually_blocked"]:
+            label = f"{a['id']} AKKAUNT — 🔴 BAND"
+            buttons.append([InlineKeyboardButton(
+                text=label,
+                callback_data=f"account_busy:{a['id']}"
+            )])
+        elif status == "active" and a["expires_at"]:
             seconds = max(0, int((a["expires_at"] - now).total_seconds()))
             if seconds > 0:
                 hh, rem = divmod(seconds, 3600)
@@ -416,9 +433,12 @@ async def choose_account(q: CallbackQuery):
             account_id
         )
         busy = await c.fetchval("""
-            SELECT EXISTS(SELECT 1 FROM bookings
+            SELECT (
+                EXISTS(SELECT 1 FROM manual_account_blocks WHERE account_id=$1)
+                OR EXISTS(SELECT 1 FROM bookings
                           WHERE account_id=$1 AND status IN ('paid','active')
                             AND (status='paid' OR expires_at > NOW()))
+            )
         """, account_id)
         prices = await c.fetch("""
             SELECT hours, price
@@ -472,9 +492,12 @@ async def choose_duration(q: CallbackQuery):
             aid, hours
         )
         busy = await c.fetchval("""
-            SELECT EXISTS(SELECT 1 FROM bookings
+            SELECT (
+                EXISTS(SELECT 1 FROM manual_account_blocks WHERE account_id=$1)
+                OR EXISTS(SELECT 1 FROM bookings
                           WHERE account_id=$1 AND status IN ('paid','active')
                             AND (status='paid' OR expires_at > NOW()))
+            )
         """, aid)
         if busy:
             await q.answer("Bu akkaunt band bo'lib qoldi. Boshqasini tanlang.", show_alert=True)
@@ -802,6 +825,7 @@ async def admin_panel(q: CallbackQuery):
             [InlineKeyboardButton(text="✏️ Akkaunt nomini/almashtirish", callback_data="admin:rename")],
             [InlineKeyboardButton(text="💰 Narxni o'zgartirish", callback_data="admin:price")],
             [InlineKeyboardButton(text="🔄 Akkauntni yashirish/ochish", callback_data="admin:toggle")],
+            [InlineKeyboardButton(text="🔴 Qo'lda band qilish / bo'shatish", callback_data="admin:manual_blocks")],
             [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")],
             [InlineKeyboardButton(text="🎁 Cashback so'rovlari", callback_data="admin:cashbacks")],
             [InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")]
@@ -893,6 +917,79 @@ async def admin_toggle_start(q: CallbackQuery, state: FSMContext):
     await q.answer()
 
 
+@dp.callback_query(F.data == "admin:manual_blocks")
+async def admin_manual_blocks(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    async with pool.acquire() as c:
+        rows = await c.fetch("""
+            SELECT a.id, a.title,
+                   EXISTS(SELECT 1 FROM manual_account_blocks mb
+                          WHERE mb.account_id=a.id) AS blocked
+            FROM accounts a
+            ORDER BY a.id
+        """)
+    buttons = []
+    for row in rows:
+        if row["blocked"]:
+            label = f"🟢 {row['id']} — Bo'shatish"
+            action = f"admin:unblock:{row['id']}"
+        else:
+            label = f"🔴 {row['id']} — Band qilish"
+            action = f"admin:block:{row['id']}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=action)])
+    buttons.append([InlineKeyboardButton(text="⬅️ Admin paneli", callback_data="admin:panel")])
+    await q.message.answer(
+        "Qo'lda band qilish yoki bo'shatish uchun akkauntni tanlang. "
+        "Qo'lda band qilingan akkauntda bo'shash vaqti ko'rsatilmaydi:",
+        reply_markup=kb(buttons)
+    )
+    await q.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:block:"))
+async def admin_manual_block(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    account_id = int(q.data.rsplit(":", 1)[1])
+    async with pool.acquire() as c:
+        exists = await c.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=$1)",
+            account_id
+        )
+        if exists:
+            await c.execute("""
+                INSERT INTO manual_account_blocks(account_id, admin_id)
+                VALUES($1, $2)
+                ON CONFLICT(account_id) DO UPDATE
+                SET admin_id=EXCLUDED.admin_id, created_at=NOW()
+            """, account_id, q.from_user.id)
+    if not exists:
+        await q.answer("Akkaunt topilmadi.", show_alert=True)
+        return
+    await q.answer("Akkaunt qo'lda band qilindi.")
+    await update_account_views()
+    await admin_manual_blocks(q)
+
+
+@dp.callback_query(F.data.startswith("admin:unblock:"))
+async def admin_manual_unblock(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    account_id = int(q.data.rsplit(":", 1)[1])
+    async with pool.acquire() as c:
+        result = await c.execute(
+            "DELETE FROM manual_account_blocks WHERE account_id=$1",
+            account_id
+        )
+    await q.answer("Akkaunt bo'shatildi." if result.endswith("1") else "Bu akkaunt qo'lda band qilinmagan.")
+    await update_account_views()
+    await admin_manual_blocks(q)
+
+
 @dp.callback_query(F.data == "admin:bookings")
 async def admin_bookings(q: CallbackQuery):
     if q.from_user.id != ADMIN_ID:
@@ -977,12 +1074,12 @@ async def reply_menu_bonus(m: Message):
     progress = total % 10
     remaining = 10 - progress if progress else 10
     text = (
-        "🎁 KHOJA RENT BONUS\n\n"
-        f"Jami tasdiqlangan ijaralar: {total} ta\n"
-        f"Keyingi yutuq uchun: {progress}/10 ta\n"
-        f"Yana kerak: {remaining} ta\n"
-        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\n\n"
-        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\n"
+        "🎁 KHOJA RENT BONUS\\n\\n"
+        f"Jami tasdiqlangan ijaralar: {total} ta\\n"
+        f"Keyingi yutuq uchun: {progress}/10 ta\\n"
+        f"Yana kerak: {remaining} ta\\n"
+        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\\n\\n"
+        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\\n"
         f"Oldin to'langan cashback: {paid:,} so'm"
     )
     buttons = []
@@ -991,11 +1088,7 @@ async def reply_menu_bonus(m: Message):
             text=f"🎉 Yutuqni olish ({claimable} ta)",
             callback_data="bonus:claim"
         )])
-    buttons.append([InlineKeyboardButton(
-        text="⬅️ Bosh menyu",
-        callback_data="home"
-    )])
-    await m.answer(text, reply_markup=kb(buttons))
+    await m.answer(text, reply_markup=kb(buttons) if buttons else None)
 
 
 @dp.message(F.text == "💬 Admin bilan aloqa")
@@ -1014,6 +1107,7 @@ async def reply_menu_admin(m: Message):
             [InlineKeyboardButton(text="✏️ Akkaunt nomini/almashtirish", callback_data="admin:rename")],
             [InlineKeyboardButton(text="💰 Narxni o'zgartirish", callback_data="admin:price")],
             [InlineKeyboardButton(text="🔄 Akkauntni yashirish/ochish", callback_data="admin:toggle")],
+            [InlineKeyboardButton(text="🔴 Qo'lda band qilish / bo'shatish", callback_data="admin:manual_blocks")],
             [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")],
             [InlineKeyboardButton(text="🎁 Cashback so'rovlari", callback_data="admin:cashbacks")],
         ])
