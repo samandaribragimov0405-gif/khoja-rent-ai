@@ -214,6 +214,29 @@ async def reset_user_flow(user_id: int, state: FSMContext):
     await state.clear()
 
 
+@dp.message(
+    F.text.in_({
+        "🎮 Akkauntlar", "🎁 BONUS", "💬 Admin bilan aloqa",
+        "📜 Qoidalar", "🧾 Qoidalar", "⚙️ Admin paneli"
+    })
+)
+async def universal_main_menu_router(m: Message, state: FSMContext):
+    # Menu buttons must work even if the user is stuck in KYC, cashback,
+    # receipt, or admin FSM state. Clear that state before opening a section.
+    await reset_user_flow(m.from_user.id, state)
+
+    if m.text == "🎮 Akkauntlar":
+        await reply_menu_accounts(m)
+    elif m.text == "🎁 BONUS":
+        await reply_menu_bonus(m)
+    elif m.text == "💬 Admin bilan aloqa":
+        await reply_menu_contact(m)
+    elif m.text in ("📜 Qoidalar", "🧾 Qoidalar"):
+        await reply_menu_rules(m)
+    elif m.text == "⚙️ Admin paneli":
+        await reply_menu_admin(m)
+
+
 @dp.message(Command("menu"))
 async def show_menu(m: Message, state: FSMContext):
     await reset_user_flow(m.from_user.id, state)
