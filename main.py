@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -36,6 +37,11 @@ pool = None
 
 class ReceiptState(StatesGroup):
     waiting_receipt = State()
+
+
+class CashbackState(StatesGroup):
+    waiting_full_name = State()
+    waiting_card_number = State()
 
 
 class AdminState(StatesGroup):
@@ -100,6 +106,29 @@ async def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_bookings_account_status
             ON bookings(account_id, status, expires_at);
+
+            CREATE TABLE IF NOT EXISTS bonus_rewards(
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                milestone_number INTEGER NOT NULL,
+                amount BIGINT NOT NULL DEFAULT 100000,
+                status TEXT NOT NULL DEFAULT 'pending',
+                full_name TEXT,
+                card_number TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                requested_at TIMESTAMPTZ,
+                paid_at TIMESTAMPTZ,
+                UNIQUE(user_id, milestone_number)
+            );
+
+            ALTER TABLE bonus_rewards
+            ADD COLUMN IF NOT EXISTS full_name TEXT;
+            ALTER TABLE bonus_rewards
+            ADD COLUMN IF NOT EXISTS card_number TEXT;
+            ALTER TABLE bonus_rewards
+            ADD COLUMN IF NOT EXISTS requested_at TIMESTAMPTZ;
+            ALTER TABLE bonus_rewards
+            ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
         """)
 
         count = await c.fetchval("SELECT COUNT(*) FROM accounts")
@@ -124,6 +153,7 @@ async def init_db():
 async def start(m: Message):
     rows = [
         [InlineKeyboardButton(text="🎮 Akkauntlar", callback_data="accounts")],
+        [InlineKeyboardButton(text="🎁 BONUS", callback_data="bonus")],
         [InlineKeyboardButton(text="💬 Admin bilan aloqa", url="https://t.me/khoja_arenda")]
     ]
     if m.from_user.id == ADMIN_ID:
@@ -132,6 +162,154 @@ async def start(m: Message):
         "Assalomu alaykum! KHOJA RENT AI botiga xush kelibsiz.\nKerakli bo'limni tanlang:",
         reply_markup=kb(rows)
     )
+
+
+
+async def get_bonus_stats(user_id: int):
+    async with pool.acquire() as c:
+        total = await c.fetchval("""
+            SELECT COUNT(*) FROM bookings
+            WHERE user_id=$1 AND status IN ('paid','active','expired')
+        """, user_id)
+        pending = await c.fetchval("""
+            SELECT COALESCE(SUM(amount),0) FROM bonus_rewards
+            WHERE user_id=$1 AND status IN ('pending','requested')
+        """, user_id)
+        paid = await c.fetchval("""
+            SELECT COALESCE(SUM(amount),0) FROM bonus_rewards
+            WHERE user_id=$1 AND status='paid'
+        """, user_id)
+        claimable = await c.fetchval("""
+            SELECT COUNT(*) FROM bonus_rewards
+            WHERE user_id=$1 AND status='pending'
+        """, user_id)
+    return int(total or 0), int(pending or 0), int(paid or 0), int(claimable or 0)
+
+
+@dp.callback_query(F.data == "bonus")
+async def customer_bonus(q: CallbackQuery):
+    total, pending, paid, claimable = await get_bonus_stats(q.from_user.id)
+    progress = total % 10
+    remaining = 10 - progress if progress else 10
+    text = (
+        "🎁 KHOJA RENT BONUS\n\n"
+        f"Jami tasdiqlangan ijaralar: {total} ta\n"
+        f"Keyingi yutuq uchun: {progress}/10 ta\n"
+        f"Yana kerak: {remaining} ta\n"
+        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\n\n"
+        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\n"
+        f"Oldin to'langan cashback: {paid:,} so'm"
+    )
+    buttons = []
+    if claimable:
+        buttons.append([InlineKeyboardButton(
+            text=f"🎉 Yutuqni olish ({claimable} ta)",
+            callback_data="bonus:claim"
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")])
+    await q.message.answer(text, reply_markup=kb(buttons))
+    await q.answer()
+
+
+@dp.callback_query(F.data == "bonus:claim")
+async def cashback_claim_start(q: CallbackQuery, state: FSMContext):
+    async with pool.acquire() as c:
+        reward = await c.fetchrow("""
+            SELECT id, amount FROM bonus_rewards
+            WHERE user_id=$1 AND status='pending'
+            ORDER BY milestone_number LIMIT 1
+        """, q.from_user.id)
+    if not reward:
+        await q.answer("Hozircha olish mumkin bo'lgan yutuq yo'q.", show_alert=True)
+        return
+    await state.update_data(cashback_reward_id=reward["id"])
+    await state.set_state(CashbackState.waiting_full_name)
+    await q.message.answer(
+        f"🎉 Siz {reward['amount']:,} so'm cashback yutdingiz!\n\n"
+        "Pulni o'tkazishimiz uchun ism va familiyangizni yuboring."
+    )
+    await q.answer()
+
+
+@dp.message(CashbackState.waiting_full_name)
+async def cashback_receive_name(m: Message, state: FSMContext):
+    full_name = " ".join((m.text or "").strip().split())
+    if not full_name or len(full_name) < 5 or len(full_name) > 100 or len(full_name.split()) < 2:
+        await m.answer("Iltimos, ism va familiyangizni to'liq yozing. Masalan: Ali Valiyev")
+        return
+    await state.update_data(cashback_full_name=full_name)
+    await state.set_state(CashbackState.waiting_card_number)
+    await m.answer("Endi cashback tushiriladigan 16 xonali karta raqamini yuboring.\nCVV, amal qilish muddati yoki SMS-kodni yubormang.")
+
+
+@dp.message(CashbackState.waiting_card_number)
+async def cashback_receive_card(m: Message, state: FSMContext):
+    card_number = re.sub(r"[\s-]", "", (m.text or ""))
+    if not re.fullmatch(r"\d{16}", card_number):
+        await m.answer("Karta raqami 16 ta raqamdan iborat bo'lishi kerak. Qayta yuboring.")
+        return
+
+    data = await state.get_data()
+    reward_id = data.get("cashback_reward_id")
+    full_name = data.get("cashback_full_name")
+    async with pool.acquire() as c:
+        reward = await c.fetchrow("""
+            UPDATE bonus_rewards
+            SET full_name=$1, card_number=$2, status='requested', requested_at=NOW()
+            WHERE id=$3 AND user_id=$4 AND status='pending'
+            RETURNING id, amount, milestone_number
+        """, full_name, card_number, reward_id, m.from_user.id)
+
+    if not reward:
+        await m.answer("Bu yutuq allaqachon so'ralgan yoki mavjud emas. BONUS bo'limini yangilang.")
+        await state.clear()
+        return
+
+    await bot.send_message(
+        ADMIN_ID,
+        "🎁 CASHBACK TO'LASH SO'ROVI\n"
+        f"Yutuq ID: {reward['id']}\n"
+        f"Mijoz ID: {m.from_user.id}\n"
+        f"Ism-familiya: {full_name}\n"
+        f"Karta raqami: {card_number}\n"
+        f"Summa: {reward['amount']:,} so'm\n"
+        f"Bosqich: {reward['milestone_number']} (har 10 ta ijara)",
+        reply_markup=kb([[
+            InlineKeyboardButton(
+                text="✅ Cashback to'landi",
+                callback_data=f"bonus_paid:{reward['id']}"
+            )
+        ]])
+    )
+    await m.answer(
+        "✅ Ma'lumotlaringiz adminga yuborildi. "
+        "Cashback kartangizga o'tkazilgach sizga xabar beramiz."
+    )
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("bonus_paid:"))
+async def cashback_mark_paid(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    reward_id = int(q.data.split(":")[1])
+    async with pool.acquire() as c:
+        reward = await c.fetchrow("""
+            UPDATE bonus_rewards
+            SET status='paid', paid_at=NOW()
+            WHERE id=$1 AND status='requested'
+            RETURNING user_id, amount
+        """, reward_id)
+    if not reward:
+        await q.answer("So'rov topilmadi yoki allaqachon to'langan.", show_alert=True)
+        return
+    await bot.send_message(
+        reward["user_id"],
+        f"🎉 {reward['amount']:,} so'm cashback kartangizga o'tkazildi. Rahmat!"
+    )
+    await q.message.edit_text((q.message.text or "") + "\n\n✅ CASHBACK TO'LANDI")
+    await q.answer("To'lov belgilandi.")
 
 
 async def account_list_view():
@@ -189,6 +367,7 @@ async def update_account_views():
 async def home(q: CallbackQuery):
     rows = [
         [InlineKeyboardButton(text="🎮 Akkauntlar", callback_data="accounts")],
+        [InlineKeyboardButton(text="🎁 BONUS", callback_data="bonus")],
         [InlineKeyboardButton(text="💬 Admin bilan aloqa", url="https://t.me/khoja_arenda")]
     ]
     if q.from_user.id == ADMIN_ID:
@@ -420,12 +599,25 @@ async def approve(q: CallbackQuery):
             "UPDATE bookings SET status='paid' WHERE id=$1",
             bid
         )
+        approved_count = await c.fetchval("""
+            SELECT COUNT(*) FROM bookings
+            WHERE user_id=$1 AND status IN ('paid','active','expired')
+        """, b["user_id"])
+        if approved_count and approved_count % 10 == 0:
+            milestone = approved_count // 10
+            await c.execute("""
+                INSERT INTO bonus_rewards(user_id, milestone_number, amount, status)
+                VALUES($1, $2, 100000, 'pending')
+                ON CONFLICT(user_id, milestone_number) DO NOTHING
+            """, b["user_id"], milestone)
 
     await bot.send_message(
         b["user_id"],
         f"Buyurtma №{bid}: to'lov tasdiqlandi.\n"
         "Ijara boshlanishini kuting. PUBG paroli, SMS/pochta kodi yoki "
         "QR autentifikatsiya tokenini botga yubormang."
+        + ("\n\n🎉 Tabriklaymiz! Har 10 ta tasdiqlangan ijarangiz uchun 100 000 so'm cashback yutdingiz. BONUS bo'limidan yutuqni oling."
+           if approved_count and approved_count % 10 == 0 else "")
     )
     await q.message.edit_caption(
         (q.message.caption or "") + "\n\nTO'LOV TASDIQLANDI"
@@ -594,9 +786,43 @@ async def admin_panel(q: CallbackQuery):
             [InlineKeyboardButton(text="💰 Narxni o'zgartirish", callback_data="admin:price")],
             [InlineKeyboardButton(text="🔄 Akkauntni yashirish/ochish", callback_data="admin:toggle")],
             [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")],
+            [InlineKeyboardButton(text="🎁 Cashback so'rovlari", callback_data="admin:cashbacks")],
             [InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")]
         ])
     )
+    await q.answer()
+
+
+
+@dp.callback_query(F.data == "admin:cashbacks")
+async def admin_cashback_requests(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    async with pool.acquire() as c:
+        rows = await c.fetch("""
+            SELECT id, user_id, amount, full_name, card_number, milestone_number
+            FROM bonus_rewards
+            WHERE status='requested'
+            ORDER BY requested_at
+            LIMIT 30
+        """)
+    if not rows:
+        await q.message.answer("Hozircha cashback to'lash so'rovlari yo'q.")
+    else:
+        for r in rows:
+            await q.message.answer(
+                "🎁 CASHBACK SO'ROVI\n"
+                f"Yutuq ID: {r['id']}\nMijoz ID: {r['user_id']}\n"
+                f"Ism-familiya: {r['full_name']}\nKarta: {r['card_number']}\n"
+                f"Summa: {r['amount']:,} so'm\nBosqich: {r['milestone_number']}",
+                reply_markup=kb([[
+                    InlineKeyboardButton(
+                        text="✅ Cashback to'landi",
+                        callback_data=f"bonus_paid:{r['id']}"
+                    )
+                ]])
+            )
     await q.answer()
 
 
