@@ -669,8 +669,12 @@ async def account_list_view():
             if seconds > 0:
                 hh, rem = divmod(seconds, 3600)
                 mm, ss = divmod(rem, 60)
-                label = f"{a['id']} AKKAUNT — 🔴 BAND ({hh:02d}:{mm:02d}:{ss:02d})"
-                buttons.append([InlineKeyboardButton(text=label[:60], callback_data=f"account_busy:{a['id']}")])
+                end_time = a["expires_at"].astimezone(TASHKENT).strftime("%H:%M")
+                label = (
+                    f"{a['id']} AKKAUNT — 🔴 BAND | BO'SHASH: {end_time} "
+                    f"({hh:02d}:{mm:02d}:{ss:02d})"
+                )
+                buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"account_busy:{a['id']}")])
             else:
                 buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
         elif status in ("awaiting_verification", "paid"):
