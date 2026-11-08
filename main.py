@@ -45,6 +45,14 @@ class CashbackState(StatesGroup):
     waiting_card_number = State()
 
 
+class KYCState(StatesGroup):
+    waiting_full_name = State()
+    waiting_passport = State()
+    waiting_location = State()
+    waiting_phone = State()
+    waiting_video = State()
+
+
 class AdminState(StatesGroup):
     waiting_price = State()
     waiting_toggle = State()
@@ -159,6 +167,23 @@ async def init_db():
             ALTER TABLE bonus_rewards ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ;
             ALTER TABLE bonus_rewards ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
             ALTER TABLE bookings ADD COLUMN IF NOT EXISTS bonus_reward_id INTEGER REFERENCES bonus_rewards(id);
+
+            CREATE TABLE IF NOT EXISTS rental_verifications(
+                booking_id INTEGER PRIMARY KEY REFERENCES bookings(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                full_name TEXT NOT NULL,
+                passport_photo_file_id TEXT NOT NULL,
+                location_text TEXT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                phone_number TEXT NOT NULL,
+                video_file_id TEXT,
+                video_note_file_id TEXT,
+                consented_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status TEXT NOT NULL DEFAULT 'pending',
+                reviewed_at TIMESTAMPTZ,
+                reviewed_by BIGINT
+            );
         """)
 
         count = await c.fetchval("SELECT COUNT(*) FROM accounts")
@@ -391,8 +416,8 @@ async def bonus_account_start(q: CallbackQuery):
               AND NOT EXISTS (SELECT 1 FROM manual_account_blocks mb WHERE mb.account_id=a.id)
               AND NOT EXISTS (
                   SELECT 1 FROM bookings b
-                  WHERE b.account_id=a.id AND b.status IN ('paid','active')
-                    AND (b.status='paid' OR b.expires_at > NOW())
+                  WHERE b.account_id=a.id AND b.status IN ('awaiting_verification','paid','active')
+                    AND (b.status IN ('awaiting_verification','paid') OR b.expires_at > NOW())
               )
             ORDER BY a.id
         """)
@@ -469,7 +494,7 @@ async def bonus_pick_account(q: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("bonus:picktariff:"))
-async def bonus_pick_tariff(q: CallbackQuery):
+async def bonus_pick_tariff(q: CallbackQuery, state: FSMContext):
     _, _, reward_id_text, account_id_text, hours_text = q.data.split(":")
     reward_id, account_id, hours = int(reward_id_text), int(account_id_text), int(hours_text)
     async with pool.acquire() as c:
@@ -500,7 +525,7 @@ async def bonus_pick_tariff(q: CallbackQuery):
             original_amount = int(price["price"])
             bonus_used = min(int(reward["amount"]), original_amount)
             due = original_amount - bonus_used
-            status = "paid" if due == 0 else "awaiting_payment"
+            status = "awaiting_verification"
             booking_id = await c.fetchval("""
                 INSERT INTO bookings(
                     user_id, account_id, hours, amount, status,
@@ -512,59 +537,13 @@ async def bonus_pick_tariff(q: CallbackQuery):
             """, q.from_user.id, account_id, hours, due, status,
                  q.from_user.username, q.from_user.first_name, q.from_user.last_name,
                  original_amount, bonus_used, reward_id)
-            if due == 0:
-                await c.execute("""
-                    UPDATE bonus_rewards SET status='redeemed', used_at=NOW()
-                    WHERE id=$1 AND status='pending'
-                """, reward_id)
-                approved_count = await c.fetchval("""
-                    SELECT COUNT(*) FROM bookings
-                    WHERE user_id=$1 AND status IN ('paid','active','expired')
-                """, q.from_user.id)
-                if approved_count and approved_count % 10 == 0:
-                    await c.execute("""
-                        INSERT INTO bonus_rewards(user_id, milestone_number, amount, status)
-                        VALUES($1,$2,100000,'pending')
-                        ON CONFLICT(user_id,milestone_number) DO NOTHING
-                    """, q.from_user.id, approved_count // 10)
-            else:
-                await c.execute("""
-                    UPDATE bonus_rewards SET status='reserved', reserved_at=NOW()
-                    WHERE id=$1 AND status='pending'
-                """, reward_id)
+            await c.execute("""
+                UPDATE bonus_rewards SET status='reserved', reserved_at=NOW()
+                WHERE id=$1 AND status='pending'
+            """, reward_id)
 
-    label = tariff_title(hours, original_amount)
-    if due == 0:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🎮 BONUS AKKAUNT BUYURTMASI №{booking_id}\n"
-            f"Mijoz: {q.from_user.full_name} (@{q.from_user.username or 'username yo‘q'})\n"
-            f"Telegram ID: {q.from_user.id}\nAkkaunt: {account['title']} (#{account_id})\n"
-            f"Tarif: {label}\nBonus ishlatildi: {bonus_used:,} so'm\n"
-            "To'lov: 0 so'm — bonus to'liq qopladi.\n"
-            f"Ijarani boshlash: /start_rental {booking_id}",
-            reply_markup=kb([[
-                InlineKeyboardButton(text="👤 Mijoz lichkasiga o'tish", url=f"tg://user?id={q.from_user.id}")
-            ], [InlineKeyboardButton(text="📦 Buyurtmalar", callback_data="admin:bookings")]])
-        )
-        await q.message.answer(
-            f"🎉 Buyurtmangiz qabul qilindi!\nAkkaunt: {account['title']}\nTarif: {label}\n"
-            f"Bonus ishlatildi: {bonus_used:,} so'm\nQo'shimcha to'lov: 0 so'm.\n"
-            "Admin ijarani ishga tushirgach sizga xabar beramiz.",
-            reply_markup=kb([[InlineKeyboardButton(text="⬅️ ASOSIY MENYU", callback_data="home")]])
-        )
-    else:
-        await q.message.answer(
-            f"🧾 BUYURTMA №{booking_id}\nAkkaunt: {account['title']}\nTarif: {label}\n"
-            f"Ijara narxi: {original_amount:,} so'm\nBonus chegirmasi: -{bonus_used:,} so'm\n"
-            f"Qolgan to'lov: {due:,} so'm\n\nTo'lov kartasi: {CARD_DETAILS}\n"
-            "Qolgan summani to'lang va chekni yuboring. Admin tasdiqlagach bonus ishlatiladi.",
-            reply_markup=kb([
-                [InlineKeyboardButton(text="📸 Chek yuborish", callback_data=f"receipt:{booking_id}")],
-                [InlineKeyboardButton(text="❌ Buyurtmani bekor qilish", callback_data=f"bonus_cancel:{booking_id}")],
-                [InlineKeyboardButton(text="⬅️ ASOSIY MENYU", callback_data="home")]
-            ])
-        )
+
+    await begin_kyc(q.message, state, booking_id)
     await q.answer("Buyurtma yaratildi.")
 
 
@@ -626,7 +605,7 @@ async def account_list_view():
         rows = await c.fetch("""
             SELECT a.id, a.title,
                    (SELECT b.status FROM bookings b
-                    WHERE b.account_id=a.id AND b.status IN ('paid','active')
+                    WHERE b.account_id=a.id AND b.status IN ('awaiting_verification','paid','active')
                     ORDER BY b.created_at DESC LIMIT 1) AS booking_status,
                    (SELECT b.expires_at FROM bookings b
                     WHERE b.account_id=a.id AND b.status='active'
@@ -659,6 +638,8 @@ async def account_list_view():
                 buttons.append([InlineKeyboardButton(text=label[:60], callback_data=f"account_busy:{a['id']}")])
             else:
                 buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
+        elif status == "awaiting_verification":
+            buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🔴 BAND (tekshiruvda)", callback_data=f"account_busy:{a['id']}")])
         elif status == "paid":
             buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🔴 BAND (ishga tushishi kutilmoqda)", callback_data=f"account_busy:{a['id']}")])
         else:
@@ -684,7 +665,24 @@ async def update_account_views():
 
 
 @dp.callback_query(F.data == "home")
-async def home(q: CallbackQuery):
+async def home(q: CallbackQuery, state: FSMContext):
+    fsm_data = await state.get_data()
+    pending_kyc_bid = fsm_data.get("kyc_booking_id")
+    if pending_kyc_bid:
+        async with pool.acquire() as c:
+            async with c.transaction():
+                pending_booking = await c.fetchrow(
+                    "SELECT bonus_reward_id FROM bookings WHERE id=$1 AND user_id=$2 AND status='awaiting_verification' FOR UPDATE",
+                    pending_kyc_bid, q.from_user.id
+                )
+                if pending_booking:
+                    await c.execute("UPDATE bookings SET status='rejected' WHERE id=$1", pending_kyc_bid)
+                    if pending_booking["bonus_reward_id"] is not None:
+                        await c.execute(
+                            "UPDATE bonus_rewards SET status='pending', reserved_at=NULL WHERE id=$1 AND status='reserved'",
+                            pending_booking["bonus_reward_id"]
+                        )
+        await state.clear()
     rows = [
         [InlineKeyboardButton(text="🎮 Akkauntlar", callback_data="accounts")],
         [InlineKeyboardButton(text="🎁 BONUS", callback_data="bonus")],
@@ -764,8 +762,348 @@ async def choose_account(q: CallbackQuery):
     await q.answer()
 
 
+
+def kyc_text():
+    return (
+        "🔐 KHOJA RENT — IJARA XAVFSIZLIGI\n\n"
+        "Buyurtmani davom ettirish uchun quyidagi ma'lumotlar so'raladi:\n"
+        "1. Ism-familiya\n2. Pasport yoki ID-karta rasmi\n"
+        "3. Jonli yoki oddiy lokatsiya\n4. Telefon raqami\n"
+        "5. Yuzingiz ko'rinadigan video yoki video-xabar.\n\n"
+        "Ma'lumotlar mijozni aniqlash va ijara xavfsizligi maqsadida bot bazasida saqlanadi. "
+        "Ular ommaga chiqarilmaydi; faqat vakolatli KHOJA RENT administratori tekshirishi mumkin. "
+        "Rozilik bermasangiz, davom etmang. Ma'lumotlarni saqlash va o'chirish bo'yicha so'rov uchun admin bilan bog'lanishingiz mumkin."
+    )
+
+
+async def begin_kyc(message: Message, state: FSMContext, booking_id: int):
+    await state.clear()
+    await state.update_data(kyc_booking_id=booking_id)
+    await message.answer(
+        kyc_text(),
+        reply_markup=kb([
+            [InlineKeyboardButton(text="✅ Roziman, davom etish", callback_data=f"kyc:consent:{booking_id}")],
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"kyc:cancel:{booking_id}")],
+            [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
+        ])
+    )
+
+
+@dp.callback_query(F.data.startswith("kyc:consent:"))
+async def kyc_consent(q: CallbackQuery, state: FSMContext):
+    bid = int(q.data.rsplit(":", 1)[1])
+    async with pool.acquire() as c:
+        ok = await c.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM bookings WHERE id=$1 AND user_id=$2 AND status='awaiting_verification')",
+            bid, q.from_user.id
+        )
+    if not ok:
+        await q.answer("Buyurtma topilmadi yoki holati o'zgargan.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(kyc_booking_id=bid)
+    await state.set_state(KYCState.waiting_full_name)
+    await q.message.answer("1/5. Ism-familiyangizni to'liq yuboring.")
+    await q.answer()
+
+
+@dp.callback_query(F.data.startswith("kyc:cancel:"))
+async def kyc_cancel(q: CallbackQuery, state: FSMContext):
+    bid = int(q.data.rsplit(":", 1)[1])
+    async with pool.acquire() as c:
+        async with c.transaction():
+            booking = await c.fetchrow(
+                "SELECT bonus_reward_id FROM bookings WHERE id=$1 AND user_id=$2 AND status='awaiting_verification' FOR UPDATE",
+                bid, q.from_user.id
+            )
+            if booking:
+                await c.execute("UPDATE bookings SET status='rejected' WHERE id=$1", bid)
+                if booking["bonus_reward_id"] is not None:
+                    await c.execute(
+                        "UPDATE bonus_rewards SET status='pending', reserved_at=NULL WHERE id=$1 AND status='reserved'",
+                        booking["bonus_reward_id"]
+                    )
+    await state.clear()
+    await q.message.answer("Buyurtma bekor qilindi.", reply_markup=kb([[InlineKeyboardButton(text="⬅️ ASOSIY MENYU", callback_data="home")]]))
+    await q.answer("Bekor qilindi.")
+
+
+@dp.message(Command("cancel"))
+async def cancel_current_flow(m: Message, state: FSMContext):
+    data = await state.get_data()
+    bid = data.get("kyc_booking_id")
+    if bid:
+        async with pool.acquire() as c:
+            async with c.transaction():
+                booking = await c.fetchrow(
+                    "SELECT bonus_reward_id FROM bookings WHERE id=$1 AND user_id=$2 AND status='awaiting_verification' FOR UPDATE",
+                    bid, m.from_user.id
+                )
+                if booking:
+                    await c.execute("UPDATE bookings SET status='rejected' WHERE id=$1", bid)
+                    if booking["bonus_reward_id"] is not None:
+                        await c.execute(
+                            "UPDATE bonus_rewards SET status='pending', reserved_at=NULL WHERE id=$1 AND status='reserved'",
+                            booking["bonus_reward_id"]
+                        )
+        await state.clear()
+        await m.answer("Jarayon bekor qilindi. Bonus ishlatilmagan bo'lsa balansingizga qaytarildi.",
+                       reply_markup=main_reply_keyboard(m.from_user.id))
+    else:
+        await state.clear()
+        await m.answer("Joriy jarayon bekor qilindi.", reply_markup=main_reply_keyboard(m.from_user.id))
+
+
+@dp.message(KYCState.waiting_full_name)
+async def kyc_name(m: Message, state: FSMContext):
+    name = " ".join((m.text or "").split())
+    if len(name) < 5 or len(name) > 100 or len(name.split()) < 2:
+        await m.answer("Ism-familiyangizni to'liq yuboring. Masalan: Ali Valiyev.")
+        return
+    await state.update_data(kyc_name=name)
+    await state.set_state(KYCState.waiting_passport)
+    await m.answer("2/5. Pasport yoki ID-kartangiz rasmini foto ko'rinishida yuboring.")
+
+
+@dp.message(KYCState.waiting_passport, F.photo)
+async def kyc_passport(m: Message, state: FSMContext):
+    await state.update_data(kyc_passport=m.photo[-1].file_id)
+    await state.set_state(KYCState.waiting_location)
+    await m.answer(
+        "3/5. Jonli yoki oddiy lokatsiyangizni yuboring. "
+        "Telegram lokatsiyasi yoki manzilni matn ko'rinishida yuborishingiz mumkin.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📍 Lokatsiyani yuborish", request_location=True)]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+    )
+
+
+@dp.message(KYCState.waiting_passport)
+async def kyc_passport_other(m: Message):
+    await m.answer("Pasport yoki ID-karta rasmini foto ko'rinishida yuboring.")
+
+
+@dp.message(KYCState.waiting_location, F.location)
+async def kyc_location(m: Message, state: FSMContext):
+    await state.update_data(
+        kyc_lat=m.location.latitude, kyc_lon=m.location.longitude,
+        kyc_location=("Jonli lokatsiya" if m.location.live_period else "Oddiy lokatsiya")
+    )
+    await state.set_state(KYCState.waiting_phone)
+    await m.answer(
+        "4/5. Telefon raqamingizni yuboring.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+    )
+
+
+@dp.message(KYCState.waiting_location, F.text)
+async def kyc_location_text(m: Message, state: FSMContext):
+    loc = (m.text or "").strip()
+    if len(loc) < 3:
+        await m.answer("Lokatsiya yuboring yoki manzilni matn ko'rinishida yozing.")
+        return
+    await state.update_data(kyc_location=loc)
+    await state.set_state(KYCState.waiting_phone)
+    await m.answer(
+        "4/5. Telefon raqamingizni yuboring.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+    )
+
+
+async def kyc_phone_next(m: Message, state: FSMContext, phone: str):
+    digits = re.sub(r"[^0-9]", "", phone)
+    if not 9 <= len(digits) <= 15:
+        await m.answer("Telefon raqamini to'g'ri formatda yuboring.")
+        return
+    await state.update_data(kyc_phone=phone)
+    await state.set_state(KYCState.waiting_video)
+    await m.answer(
+        "5/5. Yuzingiz ko'rinadigan video yoki dumaloq video-xabar yuboring. "
+        "Unda ism-familiyangiz, sana, akkaunt va ijara muddatini ayting. "
+        "Shuningdek, qoidalarni buzib o'z aybingiz bilan akkauntga zarar yetkazsangiz, "
+        "shartnomadagi tartibda zararni qoplashga roziligingizni bildiring.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ Asosiy menyu")]],
+            resize_keyboard=True
+        )
+    )
+
+
+@dp.message(KYCState.waiting_phone, F.contact)
+async def kyc_phone_contact(m: Message, state: FSMContext):
+    if m.contact.user_id and m.contact.user_id != m.from_user.id:
+        await m.answer("Iltimos, o'zingizning telefon raqamingizni yuboring.")
+        return
+    await kyc_phone_next(m, state, m.contact.phone_number)
+
+
+@dp.message(KYCState.waiting_phone, F.text)
+async def kyc_phone_text(m: Message, state: FSMContext):
+    await kyc_phone_next(m, state, m.text or "")
+
+
+async def kyc_finish(m: Message, state: FSMContext, video_id=None, video_note_id=None):
+    data = await state.get_data()
+    bid = data.get("kyc_booking_id")
+    async with pool.acquire() as c:
+        await c.execute("""
+            INSERT INTO rental_verifications(
+                booking_id,user_id,full_name,passport_photo_file_id,location_text,
+                latitude,longitude,phone_number,video_file_id,video_note_file_id,status
+            ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
+            ON CONFLICT(booking_id) DO UPDATE SET
+                full_name=EXCLUDED.full_name,
+                passport_photo_file_id=EXCLUDED.passport_photo_file_id,
+                location_text=EXCLUDED.location_text,
+                latitude=EXCLUDED.latitude, longitude=EXCLUDED.longitude,
+                phone_number=EXCLUDED.phone_number,
+                video_file_id=EXCLUDED.video_file_id,
+                video_note_file_id=EXCLUDED.video_note_file_id,
+                status='pending', consented_at=NOW()
+        """, bid, m.from_user.id, data["kyc_name"], data["kyc_passport"],
+             data.get("kyc_location"), data.get("kyc_lat"), data.get("kyc_lon"),
+             data["kyc_phone"], video_id, video_note_id)
+    caption = (
+        f"🔐 IJARA XAVFSIZLIK TEKSHIRUVI — BUYURTMA №{bid}\n"
+        f"Ism-familiya: {data['kyc_name']}\n"
+        f"Telegram ID: {m.from_user.id}\nTelefon: {data['kyc_phone']}\n"
+        f"Lokatsiya: {data.get('kyc_location') or 'yuborilgan lokatsiya'}\n"
+        "Maxfiy ma'lumot: faqat vakolatli admin tekshiruvi uchun."
+    )
+    await bot.send_photo(
+        ADMIN_ID, data["kyc_passport"], caption=caption,
+        reply_markup=kb([
+            [InlineKeyboardButton(text="✅ Tasdiqlash — karta yuborish", callback_data=f"kyc:approve:{bid}")],
+            [InlineKeyboardButton(text="❌ Rad etish", callback_data=f"kyc:reject:{bid}")],
+            [InlineKeyboardButton(text="👤 Mijoz lichkasi", url=f"tg://user?id={m.from_user.id}")]
+        ])
+    )
+    if video_id:
+        await bot.send_video(ADMIN_ID, video_id, caption=f"Video rozilik — buyurtma №{bid}")
+    if video_note_id:
+        await bot.send_video_note(ADMIN_ID, video_note_id)
+    if data.get("kyc_lat") is not None:
+        await bot.send_location(ADMIN_ID, data["kyc_lat"], data["kyc_lon"])
+    await m.answer(
+        "✅ Ma'lumotlaringiz admin tekshiruviga yuborildi. Tasdiqlangach, to'lov kartasi yuboriladi.",
+        reply_markup=main_reply_keyboard(m.from_user.id)
+    )
+    await state.clear()
+
+
+@dp.message(KYCState.waiting_video, F.video)
+async def kyc_video(m: Message, state: FSMContext):
+    await kyc_finish(m, state, video_id=m.video.file_id)
+
+
+@dp.message(KYCState.waiting_video, F.video_note)
+async def kyc_video_note(m: Message, state: FSMContext):
+    await kyc_finish(m, state, video_note_id=m.video_note.file_id)
+
+
+@dp.message(KYCState.waiting_video)
+async def kyc_video_other(m: Message):
+    await m.answer("Video yoki dumaloq video-xabar yuboring.")
+
+
+@dp.callback_query(F.data.startswith("kyc:approve:"))
+async def kyc_approve(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    bid = int(q.data.rsplit(":", 1)[1])
+    async with pool.acquire() as c:
+        async with c.transaction():
+            b = await c.fetchrow("""
+                SELECT b.*, a.title FROM bookings b
+                JOIN accounts a ON a.id=b.account_id
+                JOIN rental_verifications v ON v.booking_id=b.id
+                WHERE b.id=$1 AND b.status='awaiting_verification' AND v.status='pending'
+                FOR UPDATE OF b
+            """, bid)
+            if not b:
+                await q.answer("Buyurtma topilmadi yoki allaqachon ko'rib chiqilgan.", show_alert=True)
+                return
+            await c.execute(
+                "UPDATE rental_verifications SET status='approved', reviewed_at=NOW(), reviewed_by=$2 WHERE booking_id=$1",
+                bid, q.from_user.id
+            )
+            due = int(b["amount"])
+            if due == 0:
+                await c.execute("UPDATE bookings SET status='paid' WHERE id=$1", bid)
+                if b["bonus_reward_id"] is not None:
+                    await c.execute(
+                        "UPDATE bonus_rewards SET status='redeemed', used_at=NOW() WHERE id=$1 AND status='reserved'",
+                        b["bonus_reward_id"]
+                    )
+            else:
+                await c.execute("UPDATE bookings SET status='awaiting_payment' WHERE id=$1", bid)
+    if due == 0:
+        await bot.send_message(
+            b["user_id"],
+            f"✅ Xavfsizlik tekshiruvi tasdiqlandi. Buyurtma №{bid} bonus bilan to'liq qoplangan. "
+            "Qo'shimcha to'lov yo'q. Admin ijarani ishga tushirgach xabar beramiz."
+        )
+        await bot.send_message(
+            ADMIN_ID,
+            f"🎮 BONUS BUYURTMASI №{bid} TASDIQLANDI. To'lov bonus bilan to'liq qoplandi. "
+            f"Ijarani boshlash uchun: /start_rental {bid}"
+        )
+        await q.message.edit_caption((q.message.caption or "") + "\n\n✅ TEKSHIRUV TASDIQLANDI")
+    else:
+        await bot.send_message(
+            b["user_id"],
+            f"✅ Xavfsizlik tekshiruvi tasdiqlandi.\nBuyurtma №{bid}\nAkkaunt: {b['title']}\n"
+            f"To'lov summasi: {due:,} so'm\n\n💳 To'lov kartasi: {CARD_DETAILS}\n"
+            "To'lovdan keyin chekni yuboring.",
+            reply_markup=kb([
+                [InlineKeyboardButton(text="📸 Chek yuborish", callback_data=f"receipt:{bid}")],
+                [InlineKeyboardButton(text="⬅️ ASOSIY MENYU", callback_data="home")]
+            ])
+        )
+        await q.message.edit_caption((q.message.caption or "") + "\n\n✅ TEKSHIRUV TASDIQLANDI — KARTA YUBORILDI")
+    await q.answer("Tekshiruv tasdiqlandi.")
+
+
+@dp.callback_query(F.data.startswith("kyc:reject:"))
+async def kyc_reject(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    bid = int(q.data.rsplit(":", 1)[1])
+    async with pool.acquire() as c:
+        async with c.transaction():
+            b = await c.fetchrow(
+                "SELECT user_id, bonus_reward_id FROM bookings WHERE id=$1 AND status='awaiting_verification' FOR UPDATE",
+                bid
+            )
+            if not b:
+                await q.answer("Buyurtma topilmadi yoki holati o'zgargan.", show_alert=True)
+                return
+            await c.execute("UPDATE bookings SET status='rejected' WHERE id=$1", bid)
+            await c.execute(
+                "UPDATE rental_verifications SET status='rejected', reviewed_at=NOW(), reviewed_by=$2 WHERE booking_id=$1",
+                bid, q.from_user.id
+            )
+            if b["bonus_reward_id"] is not None:
+                await c.execute(
+                    "UPDATE bonus_rewards SET status='pending', reserved_at=NULL WHERE id=$1 AND status='reserved'",
+                    b["bonus_reward_id"]
+                )
+    await bot.send_message(b["user_id"], "❌ Xavfsizlik tekshiruvi rad etildi. Admin bilan bog'laning.")
+    await q.message.edit_caption((q.message.caption or "") + "\n\n❌ TEKSHIRUV RAD ETILDI")
+    await q.answer("Rad etildi.")
+
+
 @dp.callback_query(F.data.startswith("duration:"))
-async def choose_duration(q: CallbackQuery):
+async def choose_duration(q: CallbackQuery, state: FSMContext):
     _, aid_text, hours_text = q.data.split(":")
     aid = int(aid_text)
     hours = int(hours_text)
@@ -797,32 +1135,13 @@ async def choose_duration(q: CallbackQuery):
 
         amount = p["price"]
         booking_id = await c.fetchval("""
-            INSERT INTO bookings(user_id, account_id, hours, amount, user_username, user_first_name, user_last_name)
-            VALUES($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO bookings(user_id, account_id, hours, amount, status, user_username, user_first_name, user_last_name)
+            VALUES($1, $2, $3, $4, 'awaiting_verification', $5, $6, $7)
             RETURNING id
         """, q.from_user.id, aid, hours, amount, q.from_user.username,
              q.from_user.first_name, q.from_user.last_name)
 
-    label = tariff_title(hours, amount)
-    await q.message.answer(
-        f"Buyurtma №{booking_id}\n"
-        f"{a['title']}\n"
-        f"Tarif: {label}\n"
-        f"Jami: {amount:,} so'm\n\n"
-        f"To'lov kartasi: {CARD_DETAILS}\n\n"
-        "To'lovni amalga oshirgach, chek rasmini yuboring. "
-        "To'lov admin tomonidan bank ilovasida tekshiriladi.",
-        reply_markup=kb([[InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
-    )
-    await q.message.answer(
-        "Chekni yuborish uchun quyidagi tugmani bosing:",
-        reply_markup=kb([[
-            InlineKeyboardButton(
-                text="Chek yuborish",
-                callback_data=f"receipt:{booking_id}"
-            )
-        ], [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]])
-    )
+    await begin_kyc(q.message, state, booking_id)
     await q.answer()
 
 
@@ -1287,6 +1606,7 @@ async def admin_bookings(q: CallbackQuery):
             hours_label = "Tungi tarif" if r["hours"] == 0 else f"{r['hours']} soat"
             created = r["created_at"].astimezone(TASHKENT).strftime("%d.%m.%Y %H:%M") if r["created_at"] else "—"
             status_names = {
+                "awaiting_verification": "Xavfsizlik tekshiruvi kutilmoqda",
                 "awaiting_payment": "To'lov kutilmoqda",
                 "receipt_received": "Chek yuborilgan",
                 "paid": "To'lov tasdiqlangan",
