@@ -639,17 +639,27 @@ async def account_list_view():
     async with pool.acquire() as c:
         rows = await c.fetch("""
             SELECT a.id, a.title,
-                   (SELECT b.status FROM bookings b
-                    WHERE b.account_id=a.id AND b.status IN ('awaiting_verification','paid','active')
-                    ORDER BY b.created_at DESC LIMIT 1) AS booking_status,
-                   (SELECT b.expires_at FROM bookings b
-                    WHERE b.account_id=a.id AND b.status='active'
-                    ORDER BY b.created_at DESC LIMIT 1) AS expires_at,
+                   current_booking.status AS booking_status,
+                   current_booking.expires_at AS expires_at,
                    EXISTS(
                        SELECT 1 FROM manual_account_blocks mb
                        WHERE mb.account_id=a.id
                    ) AS manually_blocked
             FROM accounts a
+            LEFT JOIN LATERAL (
+                SELECT b.status, b.expires_at
+                FROM bookings b
+                WHERE b.account_id=a.id
+                  AND b.status IN ('awaiting_verification','paid','active')
+                ORDER BY
+                    CASE
+                        WHEN b.status='active' AND b.expires_at IS NOT NULL THEN 0
+                        WHEN b.status='paid' THEN 1
+                        ELSE 2
+                    END,
+                    b.created_at DESC
+                LIMIT 1
+            ) AS current_booking ON TRUE
             WHERE a.active=TRUE
             ORDER BY a.id
         """)
@@ -674,7 +684,7 @@ async def account_list_view():
                     f"{a['id']} AKKAUNT — 🔴 BAND | BO'SHASH: {end_time} "
                     f"({hh:02d}:{mm:02d}:{ss:02d})"
                 )
-                buttons.append([InlineKeyboardButton(text=label[:64], callback_data=f"account_busy:{a['id']}")])
+                buttons.append([InlineKeyboardButton(text=label, callback_data=f"account_busy:{a['id']}")])
             else:
                 buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
         elif status in ("awaiting_verification", "paid"):
