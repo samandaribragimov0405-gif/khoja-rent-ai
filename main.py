@@ -977,12 +977,12 @@ async def reply_menu_bonus(m: Message):
     progress = total % 10
     remaining = 10 - progress if progress else 10
     text = (
-        "🎁 KHOJA RENT BONUS\\n\\n"
-        f"Jami tasdiqlangan ijaralar: {total} ta\\n"
-        f"Keyingi yutuq uchun: {progress}/10 ta\\n"
-        f"Yana kerak: {remaining} ta\\n"
-        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\\n\\n"
-        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\\n"
+        "🎁 KHOJA RENT BONUS\n\n"
+        f"Jami tasdiqlangan ijaralar: {total} ta\n"
+        f"Keyingi yutuq uchun: {progress}/10 ta\n"
+        f"Yana kerak: {remaining} ta\n"
+        "Har 10 ta tasdiqlangan ijara uchun 100 000 so'm cashback!\n\n"
+        f"To'lanishi kutilayotgan cashback: {pending:,} so'm\n"
         f"Oldin to'langan cashback: {paid:,} so'm"
     )
     buttons = []
@@ -991,7 +991,11 @@ async def reply_menu_bonus(m: Message):
             text=f"🎉 Yutuqni olish ({claimable} ta)",
             callback_data="bonus:claim"
         )])
-    await m.answer(text, reply_markup=kb(buttons) if buttons else None)
+    buttons.append([InlineKeyboardButton(
+        text="⬅️ Bosh menyu",
+        callback_data="home"
+    )])
+    await m.answer(text, reply_markup=kb(buttons))
 
 
 @dp.message(F.text == "💬 Admin bilan aloqa")
