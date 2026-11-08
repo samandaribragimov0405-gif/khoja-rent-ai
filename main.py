@@ -157,17 +157,17 @@ async def account_list_view():
             if seconds > 0:
                 hh, rem = divmod(seconds, 3600)
                 mm, ss = divmod(rem, 60)
-                label = f"🔴 {a['title']} — BAND ({hh:02d}:{mm:02d}:{ss:02d})"
+                label = f"{a['id']} AKKAUNT — 🔴 BAND ({hh:02d}:{mm:02d}:{ss:02d})"
                 buttons.append([InlineKeyboardButton(text=label[:60], callback_data=f"account_busy:{a['id']}")])
             else:
-                buttons.append([InlineKeyboardButton(text=f"🟢 {a['title']} — BO'SH", callback_data=f"account:{a['id']}")])
+                buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
         elif status == "paid":
-            buttons.append([InlineKeyboardButton(text=f"🔴 {a['title']} — TO'LOV TASDIQLANGAN", callback_data=f"account_busy:{a['id']}")])
+            buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🔴 BAND (ishga tushishi kutilmoqda)", callback_data=f"account_busy:{a['id']}")])
         else:
-            buttons.append([InlineKeyboardButton(text=f"🟢 {a['title']} — BO'SH", callback_data=f"account:{a['id']}")])
+            buttons.append([InlineKeyboardButton(text=f"{a['id']} AKKAUNT — 🟢 BO'SH", callback_data=f"account:{a['id']}")])
     buttons.append([InlineKeyboardButton(text="🔄 Yangilash", callback_data="accounts")])
     buttons.append([InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="home")])
-    text = "🎮 KHOJA RENT — AKKAUNTLAR\n\n🟢 BO'SH — buyurtma berish mumkin\n🔴 BAND — bo'shashini kuting"
+    text = "🎮 KHOJA RENT — AKKAUNTLAR\n\n🟢 BO'SH — tanlab buyurtma bering\n🔴 BAND — qolgan vaqt ko'rsatiladi"
     if not rows:
         text += "\n\nHozircha faol akkaunt yo'q."
     return text, kb(buttons)
