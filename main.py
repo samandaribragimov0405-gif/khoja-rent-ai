@@ -5,11 +5,13 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import asyncpg
+from openai import AsyncOpenAI
+from collections import defaultdict, deque
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand, MenuButtonCommands, ReplyKeyboardMarkup, KeyboardButton
+    BotCommand, MenuButtonCommands, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -19,6 +21,10 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 CARD_DETAILS = os.getenv("CARD_DETAILS", "Admin bilan bog'laning")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+AI_CLIENT = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+AI_HISTORY = defaultdict(lambda: deque(maxlen=12))
 
 TASHKENT = ZoneInfo("Asia/Tashkent")
 # 0 = tungi tarif; tugash vaqti keyingi tegishli 09:00.
@@ -2110,6 +2116,77 @@ async def expiry_watcher():
 
         await update_account_views()
         await asyncio.sleep(10)
+
+
+
+AI_SYSTEM_PROMPT = """
+Siz KHOJA RENT xizmatining ko'p tilli AI yordamchisisiz.
+Foydalanuvchi qaysi tilda yozsa, o'sha tilda (o'zbek, rus yoki ingliz) javob bering.
+Qisqa, muloyim va aniq gapiring. Faqat KHOJA RENT xizmatiga oid savollarga yordam bering.
+Akkaunt ijarasi, tarif, hujjat topshirish, to'lov, QR orqali kirish va qoidalarni tushuntiring.
+Narxlar akkaunt va admin sozlamalariga qarab o'zgarishi mumkin; bazadan tekshirmasdan narx yoki bo'sh akkauntni va'da qilmang.
+Hujjat, to'lov yoki QR tekshiruvini o'zingiz tasdiqlamang. Bunday ishlarni faqat admin bajaradi.
+Ijara vaqti admin mijoz akkauntga kirganini tasdiqlagan paytda boshlanishini ayting.
+PUBG paroli, SMS/pochta kodi, 2FA kodi yoki maxfiy autentifikatsiya tokenlarini so'ramang.
+To'lov qaytarilishi yoki nizoli masalalarda admin bilan bog'lanishni tavsiya qiling.
+Hech qachon admin vakolatiga ega ekaningizni yoki buyurtma holatini o'zgartirganingizni da'vo qilmang.
+"""
+
+async def ai_reply(user_id: int, user_text: str) -> str:
+    if AI_CLIENT is None:
+        return "AI yordamchi hozir sozlanmagan. Admin OPENAI_API_KEY kalitini Railway Variables bo'limiga qo'shishi kerak."
+    history = AI_HISTORY[user_id]
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+    messages.extend(list(history))
+    messages.append({"role": "user", "content": user_text})
+    response = await AI_CLIENT.chat.completions.create(
+        model=AI_MODEL, messages=messages, temperature=0.4, max_tokens=500
+    )
+    answer = (response.choices[0].message.content or "").strip()
+    if not answer:
+        answer = "Kechirasiz, hozir javob tayyorlay olmadim. Admin bilan bog'laning."
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": answer})
+    return answer
+
+@dp.message(StateFilter(None), F.voice)
+async def ai_voice_chat(m: Message):
+    if AI_CLIENT is None:
+        await m.answer("Ovozli AI ishlashi uchun admin OPENAI_API_KEY sozlashi kerak.")
+        return
+    status = await m.answer("🎧 Ovozli xabaringizni tinglayapman...")
+    try:
+        voice_file = await bot.get_file(m.voice.file_id)
+        audio_stream = await bot.download_file(voice_file.file_path)
+        audio_stream.name = "voice.ogg"
+        transcription = await AI_CLIENT.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe", file=audio_stream
+        )
+        spoken_text = transcription.text.strip()
+        if not spoken_text:
+            await status.edit_text("Ovozni tushuna olmadim. Iltimos, qayta yuboring.")
+            return
+        answer = await ai_reply(m.from_user.id, spoken_text)
+        speech = await AI_CLIENT.audio.speech.create(
+            model="gpt-4o-mini-tts", voice="alloy", input=answer, response_format="mp3"
+        )
+        await status.delete()
+        await m.answer(f"🗣 Siz: {spoken_text}\n\n🤖 KHOJA RENT AI: {answer}")
+        await m.answer_voice(BufferedInputFile(speech.content, filename="khoja-rent-ai.mp3"))
+    except Exception as e:
+        print("AI voice error:", repr(e))
+        await status.edit_text("Ovozli javob tayyorlashda xatolik yuz berdi. Matn orqali yozib ko'ring.")
+
+@dp.message(StateFilter(None), F.text, ~F.text.startswith("/"))
+async def ai_text_chat(m: Message):
+    menu_texts = {"🎮 Akkauntlar", "🎁 BONUS", "💬 Admin bilan aloqa", "📜 Qoidalar", "⚙️ Admin paneli"}
+    if m.text in menu_texts:
+        return
+    try:
+        await m.answer(await ai_reply(m.from_user.id, m.text))
+    except Exception as e:
+        print("AI text error:", repr(e))
+        await m.answer("AI bilan bog'lanishda xatolik yuz berdi. Birozdan keyin urinib ko'ring.")
 
 
 async def main():
