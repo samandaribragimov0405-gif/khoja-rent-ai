@@ -1855,7 +1855,7 @@ async def admin_cancel_booking(q: CallbackQuery):
     async with pool.acquire() as c:
         async with c.transaction():
             booking = await c.fetchrow("""
-                SELECT id, user_id, account_id, status, bonus_reward_id
+                SELECT id, user_id, account_id, status
                 FROM bookings
                 WHERE id=$1
                   AND status IN (
@@ -1866,36 +1866,57 @@ async def admin_cancel_booking(q: CallbackQuery):
             """, booking_id)
 
             if not booking:
-                await q.answer(
-                    "Buyurtma topilmadi yoki uni bekor qilib bo'lmaydi.",
-                    show_alert=True
-                )
+                await q.answer("Buyurtma topilmadi yoki bekor qilib bo'lmaydi.", show_alert=True)
                 return
+
+            # To'liq bo'shatish: shu akkauntdagi eski/test band buyurtmalar ham bekor qilinadi.
+            affected = await c.fetch("""
+                SELECT user_id, bonus_reward_id
+                FROM bookings
+                WHERE account_id=$1
+                  AND status IN (
+                      'awaiting_verification','awaiting_payment',
+                      'receipt_received','paid','active'
+                  )
+                FOR UPDATE
+            """, booking["account_id"])
 
             await c.execute("""
                 UPDATE bookings
                 SET status='cancelled', expires_at=NULL
-                WHERE id=$1
-            """, booking_id)
+                WHERE account_id=$1
+                  AND status IN (
+                      'awaiting_verification','awaiting_payment',
+                      'receipt_received','paid','active'
+                  )
+            """, booking["account_id"])
 
-            # If the booking had reserved/redeemed bonus and was cancelled
-            # before/during rental, restore it to the customer's available balance.
-            if booking["bonus_reward_id"] is not None:
-                await c.execute("""
-                    UPDATE bonus_rewards
-                    SET status='pending', reserved_at=NULL, used_at=NULL
-                    WHERE id=$1 AND status IN ('reserved','redeemed')
-                """, booking["bonus_reward_id"])
+            await c.execute(
+                "DELETE FROM manual_account_blocks WHERE account_id=$1",
+                booking["account_id"]
+            )
 
-    await bot.send_message(
-        booking["user_id"],
-        f"⛔ Buyurtma №{booking_id} admin tomonidan bekor qilindi. "
-        "Akkaunt qayta bo'shatildi. To'lovni qaytarish masalasi admin bilan alohida kelishiladi."
-    )
+            for item in affected:
+                if item["bonus_reward_id"] is not None:
+                    await c.execute("""
+                        UPDATE bonus_rewards
+                        SET status='pending', reserved_at=NULL, used_at=NULL
+                        WHERE id=$1 AND status IN ('reserved','redeemed')
+                    """, item["bonus_reward_id"])
+
+    for user_id in {item["user_id"] for item in affected}:
+        try:
+            await bot.send_message(
+                user_id,
+                f"⛔ {booking['account_id']}-akkaunt bo'yicha buyurtma admin tomonidan bekor qilindi. "
+                "Akkaunt qayta bo'shatildi. To'lovni qaytarish admin bilan alohida kelishiladi."
+            )
+        except Exception:
+            pass
+
     await q.message.edit_reply_markup(reply_markup=None)
-    await q.answer("Buyurtma bekor qilindi. Akkaunt darhol bo'shatildi.")
+    await q.answer("Akkauntdagi barcha band buyurtmalar va qo'lda blok olib tashlandi.")
     await update_account_views()
-
 
 @dp.callback_query(F.data == "admin:bookings")
 async def admin_bookings(q: CallbackQuery):
