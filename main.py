@@ -989,7 +989,10 @@ async def cancel_current_flow(m: Message, state: FSMContext):
 
 
 @dp.message(
-    KYCState,
+    StateFilter(
+        KYCState.waiting_full_name, KYCState.waiting_passport,
+        KYCState.waiting_location, KYCState.waiting_phone, KYCState.waiting_video
+    ),
     F.text.in_({
         "🎮 Akkauntlar", "🎁 BONUS", "💬 Admin bilan aloqa",
         "📜 Qoidalar", "🧾 Qoidalar", "⚙️ Admin paneli",
@@ -1020,7 +1023,13 @@ async def kyc_main_menu_navigation(m: Message, state: FSMContext):
         )
 
 
-@dp.message(KYCState, F.text == "⬅️ Asosiy menyu")
+@dp.message(
+    StateFilter(
+        KYCState.waiting_full_name, KYCState.waiting_passport,
+        KYCState.waiting_location, KYCState.waiting_phone, KYCState.waiting_video
+    ),
+    F.text == "⬅️ Asosiy menyu"
+)
 async def kyc_reply_home(m: Message, state: FSMContext):
     data = await state.get_data()
     booking_id = data.get("kyc_booking_id")
