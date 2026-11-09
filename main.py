@@ -1845,6 +1845,58 @@ async def admin_manual_unblock(q: CallbackQuery):
     await admin_manual_blocks(q)
 
 
+@dp.callback_query(F.data.startswith("admin:cancel_booking:"))
+async def admin_cancel_booking(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+
+    booking_id = int(q.data.rsplit(":", 1)[1])
+    async with pool.acquire() as c:
+        async with c.transaction():
+            booking = await c.fetchrow("""
+                SELECT id, user_id, account_id, status, bonus_reward_id
+                FROM bookings
+                WHERE id=$1
+                  AND status IN (
+                      'awaiting_verification','awaiting_payment',
+                      'receipt_received','paid','active'
+                  )
+                FOR UPDATE
+            """, booking_id)
+
+            if not booking:
+                await q.answer(
+                    "Buyurtma topilmadi yoki uni bekor qilib bo'lmaydi.",
+                    show_alert=True
+                )
+                return
+
+            await c.execute("""
+                UPDATE bookings
+                SET status='cancelled', expires_at=NULL
+                WHERE id=$1
+            """, booking_id)
+
+            # If the booking had reserved/redeemed bonus and was cancelled
+            # before/during rental, restore it to the customer's available balance.
+            if booking["bonus_reward_id"] is not None:
+                await c.execute("""
+                    UPDATE bonus_rewards
+                    SET status='pending', reserved_at=NULL, used_at=NULL
+                    WHERE id=$1 AND status IN ('reserved','redeemed')
+                """, booking["bonus_reward_id"])
+
+    await bot.send_message(
+        booking["user_id"],
+        f"⛔ Buyurtma №{booking_id} admin tomonidan bekor qilindi. "
+        "Akkaunt qayta bo'shatildi. To'lovni qaytarish masalasi admin bilan alohida kelishiladi."
+    )
+    await q.message.edit_reply_markup(reply_markup=None)
+    await q.answer("Buyurtma bekor qilindi. Akkaunt darhol bo'shatildi.")
+    await update_account_views()
+
+
 @dp.callback_query(F.data == "admin:bookings")
 async def admin_bookings(q: CallbackQuery):
     if q.from_user.id != ADMIN_ID:
@@ -1879,6 +1931,7 @@ async def admin_bookings(q: CallbackQuery):
                 "active": "Ijara faol",
                 "expired": "Muddati tugagan",
                 "rejected": "Rad etilgan",
+                "cancelled": "Bekor qilingan",
             }
             profile_url = f"https://t.me/{r['user_username']}" if r["user_username"] else f"tg://user?id={r['user_id']}"
             text = (
@@ -1894,13 +1947,20 @@ async def admin_bookings(q: CallbackQuery):
                 + f"📌 Holat: {status_names.get(r['status'], r['status'])}\n"
                 f"🗓 Buyurtma vaqti: {created}"
             )
-            await q.message.answer(
-                text,
-                reply_markup=kb([
-                    [InlineKeyboardButton(text="👤 Mijoz lichkasiga o'tish", url=profile_url)],
-                    [InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")]
+            booking_buttons = [
+                [InlineKeyboardButton(text="👤 Mijoz lichkasiga o'tish", url=profile_url)]
+            ]
+            if r["status"] in ("awaiting_verification", "awaiting_payment", "receipt_received", "paid", "active"):
+                booking_buttons.append([
+                    InlineKeyboardButton(
+                        text="⛔ Buyurtmani bekor qilish / akkauntni bo'shatish",
+                        callback_data=f"admin:cancel_booking:{r['id']}"
+                    )
                 ])
-            )
+            booking_buttons.append([
+                InlineKeyboardButton(text="⬅️ Asosiy menyu", callback_data="home")
+            ])
+            await q.message.answer(text, reply_markup=kb(booking_buttons))
     await q.answer()
 
 
