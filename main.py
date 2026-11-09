@@ -2254,11 +2254,32 @@ async def ai_voice_chat(m: Message):
     await m.answer(f"🗣 Siz: {spoken_text}\n\n🤖 KHOJA RENT AI: {answer}")
     try:
         speech = await AI_CLIENT.audio.speech.create(
-            model="gpt-4o-mini-tts", voice="alloy", input=answer, response_format="mp3"
+            model="gpt-4o-mini-tts",
+            voice="alloy",
+            input=answer[:3500],
+            response_format="mp3",
         )
-        await m.answer_voice(BufferedInputFile(speech.content, filename="khoja-rent-ai.mp3"))
+        audio_bytes = speech.content
+        if not audio_bytes:
+            raise RuntimeError("OpenAI TTS bo'sh audio qaytardi.")
+
+        audio_file = BufferedInputFile(audio_bytes, filename="khoja-rent-ai.mp3")
+        try:
+            # Avval Telegram voice xabari sifatida yuborishga urinib ko'ramiz.
+            await m.answer_voice(audio_file)
+        except Exception as send_voice_error:
+            print("Telegram send_voice error:", repr(send_voice_error))
+            # MP3 voice format sifatida qabul qilinmasa, hech bo'lmasa audio qilib yuboramiz.
+            audio_file_fallback = BufferedInputFile(audio_bytes, filename="khoja-rent-ai.mp3")
+            await m.answer_audio(audio_file_fallback, title="KHOJA RENT AI javobi")
     except Exception as e:
+        user_msg, detail = explain_ai_error(e)
         print("AI TTS error:", repr(e))
+        await notify_admin_ai_error("Ovoz yaratish (TTS) xatosi: " + detail)
+        try:
+            await m.answer("🔇 Hozir ovozli javob yaratilmadi, lekin matnli javob yuqorida yuborildi. Ovoz xatosi adminga bildirildi.")
+        except Exception:
+            pass
 
 
 @dp.message(StateFilter(None), F.text, ~F.text.startswith("/"))
