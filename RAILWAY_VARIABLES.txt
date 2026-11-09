@@ -1,0 +1,10 @@
+Add these two variables in Railway -> KHOJA RENT AI service -> Variables:
+
+ELEVENLABS_API_KEY=your_private_api_key
+ELEVENLABS_VOICE_ID=your_selected_female_voice_id
+
+Optional:
+ELEVENLABS_MODEL=eleven_v3
+
+Keep your API key private. Do not send it in Telegram or screenshots.
+Existing variables such as BOT_TOKEN, ADMIN_ID, DATABASE_URL, OPENAI_API_KEY remain required.

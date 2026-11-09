@@ -1,6 +1,9 @@
 import os
 import re
 import asyncio
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -24,6 +27,9 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 CARD_DETAILS = os.getenv("CARD_DETAILS", "Admin bilan bog'laning")
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 AI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+ELEVENLABS_VOICE_ID = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
+ELEVENLABS_MODEL = (os.getenv("ELEVENLABS_MODEL") or "eleven_v3").strip()
 AI_CLIENT = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=40.0, max_retries=2) if OPENAI_API_KEY else None
 AI_HISTORY = defaultdict(lambda: deque(maxlen=12))
 
@@ -2131,8 +2137,7 @@ async def expiry_watcher():
 
 AI_SYSTEM_PROMPT = """
 Siz KHOJA RENT xizmatining ko'p tilli AI yordamchisisiz.
-Foydalanuvchi qaysi tilda yozsa yoki gapirsa, aynan o'sha tilda — o'zbek, rus yoki ingliz tilida — tabiiy javob bering.
-Tilni o'zingiz aniqlang. Foydalanuvchi so'ramasa, javobni tarjima qilmang va tillarni aralashtirmang.
+Foydalanuvchi qaysi tilda yozsa, o'sha tilda (o'zbek, rus yoki ingliz) javob bering.
 Qisqa, muloyim va aniq gapiring. Faqat KHOJA RENT xizmatiga oid savollarga yordam bering.
 Akkaunt ijarasi, tarif, hujjat topshirish, to'lov, QR orqali kirish va qoidalarni tushuntiring.
 Narxlar akkaunt va admin sozlamalariga qarab o'zgarishi mumkin; bazadan tekshirmasdan narx yoki bo'sh akkauntni va'da qilmang.
@@ -2180,6 +2185,55 @@ async def notify_admin_ai_error(detail: str):
         await bot.send_message(ADMIN_ID, f"⚠️ AI xatosi:\n{detail[:900]}")
     except Exception as e:
         print("Admin AI alert error:", repr(e))
+
+
+def _elevenlabs_tts_sync(text: str) -> bytes:
+    """Generate expressive multilingual speech with the configured ElevenLabs voice."""
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("ELEVENLABS_API_KEY Railway Variables'da yo'q.")
+    if not ELEVENLABS_VOICE_ID:
+        raise RuntimeError("ELEVENLABS_VOICE_ID Railway Variables'da yo'q.")
+
+    url = (
+        f"https://api.elevenlabs.io/v1/text-to-speech/"
+        f"{ELEVENLABS_VOICE_ID}?output_format=mp3_44100_128"
+    )
+    payload = {
+        "text": text[:4500],
+        "model_id": ELEVENLABS_MODEL,
+        "language_code": "uz" if any(ch in text.lower() for ch in "ўқғҳқ") else None,
+        "voice_settings": {
+            "stability": 0.42,
+            "similarity_boost": 0.82,
+            "style": 0.55,
+            "use_speaker_boost": True,
+        },
+    }
+    # language_code ni modelning o'zi aniqlashi uchun odatda yubormaymiz.
+    payload.pop("language_code", None)
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            audio = response.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:700]
+        raise RuntimeError(f"ElevenLabs API HTTP {e.code}: {detail}") from e
+    if not audio:
+        raise RuntimeError("ElevenLabs bo'sh audio qaytardi.")
+    return audio
+
+
+async def elevenlabs_tts(text: str) -> bytes:
+    return await asyncio.to_thread(_elevenlabs_tts_sync, text)
 
 
 async def ai_reply(user_id: int, user_text: str) -> str:
@@ -2233,9 +2287,7 @@ async def ai_voice_chat(m: Message):
         audio_stream = await bot.download_file(voice_file.file_path)
         audio_stream.name = "voice.ogg"
         transcription = await AI_CLIENT.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=audio_stream,
-            prompt="Audio o'zbek, rus yoki ingliz tilida bo'lishi mumkin. Nutq qaysi tilda bo'lsa, o'sha tilda yozib bering, tarjima qilmang. KHOJA RENT, PUBG, akkaunt, ijara, to'lov, bonus kabi atamalar va nomlarni to'g'ri saqlang."
+            model="gpt-4o-mini-transcribe", file=audio_stream
         )
         spoken_text = (transcription.text or "").strip()
         if not spoken_text:
@@ -2256,16 +2308,7 @@ async def ai_voice_chat(m: Message):
         pass
     await m.answer(f"🗣 Siz: {spoken_text}\n\n🤖 KHOJA RENT AI: {answer}")
     try:
-        speech = await AI_CLIENT.audio.speech.create(
-            model="gpt-4o-mini-tts",
-            voice="shimmer",
-            input=answer[:3500],
-            instructions="Speak in the same language as the input text: Uzbek, Russian, or English. Do not translate or mix languages. Use a pleasant, warm, natural adult feminine voice, with a gentle friendly youthful tone. Pronounce the language naturally and clearly, at a moderate pace, with natural pauses. Preserve names, numbers, and prices exactly.",
-            response_format="mp3",
-        )
-        audio_bytes = speech.content
-        if not audio_bytes:
-            raise RuntimeError("OpenAI TTS bo'sh audio qaytardi.")
+        audio_bytes = await elevenlabs_tts(answer)
 
         audio_file = BufferedInputFile(audio_bytes, filename="khoja-rent-ai.mp3")
         try:
@@ -2305,7 +2348,8 @@ async def main():
     await init_db()
     print(
         "BOT ISHGA TUSHDI | AI:", "yoqilgan" if AI_CLIENT else "OPENAI_API_KEY YO'Q",
-        "| model:", AI_MODEL, "| openai:", openai.__version__
+        "| model:", AI_MODEL, "| openai:", openai.__version__,
+        "| ElevenLabs:", "sozlangan" if (ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID) else "kalit/voice ID kutilmoqda"
     )
 
     # Telegram chat input yonidagi menyu tugmasini yoqadi.
