@@ -123,6 +123,9 @@ async def init_db():
             ADD COLUMN IF NOT EXISTS receipt_file_id TEXT;
 
             ALTER TABLE bookings
+            ADD COLUMN IF NOT EXISTS qr_file_id TEXT;
+
+            ALTER TABLE bookings
             ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 
             ALTER TABLE bookings
@@ -1220,12 +1223,13 @@ async def kyc_approve(q: CallbackQuery):
         await bot.send_message(
             b["user_id"],
             f"✅ Xavfsizlik tekshiruvi tasdiqlandi. Buyurtma №{bid} bonus bilan to'liq qoplangan. "
-            "Qo'shimcha to'lov yo'q. Admin ijarani ishga tushirgach xabar beramiz."
+            "Qo'shimcha to'lov yo'q. Endi akkauntga kirish uchun kerakli QR-kodni yuboring. "
+            "Admin mijoz kirganini tasdiqlagach ijara vaqti boshlanadi."
         )
         await bot.send_message(
             ADMIN_ID,
             f"🎮 BONUS BUYURTMASI №{bid} TASDIQLANDI. To'lov bonus bilan to'liq qoplandi. "
-            f"Ijarani boshlash uchun: /start_rental {bid}"
+            "Mijozdan QR-kod kutilmoqda; admin kirishni tasdiqlaganda ijara boshlanadi."
         )
         await q.message.edit_caption((q.message.caption or "") + "\n\n✅ TEKSHIRUV TASDIQLANDI")
     else:
@@ -1440,8 +1444,9 @@ async def approve(q: CallbackQuery):
     await bot.send_message(
         b["user_id"],
         f"Buyurtma №{bid}: to'lov tasdiqlandi.\n"
-        "Ijara boshlanishini kuting. PUBG paroli, SMS/pochta kodi yoki "
-        "QR autentifikatsiya tokenini botga yubormang."
+        "Endi akkauntga kirish uchun kerakli QR-kodni yuboring. "
+        "Admin QR-kod orqali kirish jarayonini tekshiradi va mijoz kirganini tasdiqlagach "
+        "ijara vaqti avtomatik boshlanadi."
         + ("\n\n🎉 Tabriklaymiz! Har 10 ta tasdiqlangan ijarangiz uchun 100 000 so'm cashback yutdingiz. BONUS bo'limidan yutuqni oling."
            if approved_count and approved_count % 10 == 0 else "")
     )
@@ -1486,51 +1491,141 @@ async def reject(q: CallbackQuery):
     await q.answer("Rad etildi.")
 
 
+@dp.message(F.photo)
+async def receive_rental_qr(m: Message):
+    """Receive the customer's PUBG login QR after payment and send it to admin for review."""
+    async with pool.acquire() as c:
+        booking = await c.fetchrow("""
+            SELECT b.id, b.account_id, b.hours, b.amount, b.user_id,
+                   a.title
+            FROM bookings b
+            JOIN accounts a ON a.id=b.account_id
+            WHERE b.user_id=$1 AND b.status='paid'
+              AND b.qr_file_id IS NULL
+            ORDER BY b.created_at DESC
+            LIMIT 1
+        """, m.from_user.id)
+        if not booking:
+            return
+        updated = await c.execute("""
+            UPDATE bookings SET qr_file_id=$1
+            WHERE id=$2 AND status='paid' AND qr_file_id IS NULL
+        """, m.photo[-1].file_id, booking["id"])
+        if updated.endswith("0"):
+            await m.answer("QR-kod allaqachon yuborilgan yoki buyurtma holati o'zgargan.")
+            return
+
+    await bot.send_photo(
+        ADMIN_ID,
+        m.photo[-1].file_id,
+        caption=(
+            f"📲 MIJOZ QR-KODI — BUYURTMA №{booking['id']}\n"
+            f"Mijoz: {m.from_user.full_name}\n"
+            f"Telegram ID: {m.from_user.id}\n"
+            f"Akkaunt: {booking['title']}\n"
+            f"Tarif: {tariff_title(booking['hours'], booking['amount'])}\n\n"
+            "QR-kodni tekshiring. Mijoz akkauntga muvaffaqiyatli kirganidan keyingina "
+            "quyidagi tasdiqlash tugmasini bosing. Shu paytda ijara vaqti boshlanadi."
+        ),
+        reply_markup=kb([
+            [InlineKeyboardButton(
+                text="✅ MIJOZ KIRDI — IJARANI BOSHLASH",
+                callback_data=f"qr_entered:{booking['id']}"
+            )],
+            [InlineKeyboardButton(
+                text="❌ QR-KODNI RAD ETISH",
+                callback_data=f"qr_reject:{booking['id']}"
+            )]
+        ])
+    )
+    await m.answer(
+        "✅ QR-kodingiz adminga yuborildi. Admin akkauntga kirganingizni tekshirib tasdiqlaydi. "
+        "Tasdiqlanmaguncha ijara vaqti boshlanmaydi."
+    )
+
+
+@dp.callback_query(F.data.startswith("qr_entered:"))
+async def admin_confirm_customer_entered(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+
+    booking_id = int(q.data.split(":")[1])
+    async with pool.acquire() as c:
+        async with c.transaction():
+            b = await c.fetchrow("""
+                SELECT b.*, a.title
+                FROM bookings b
+                JOIN accounts a ON a.id=b.account_id
+                WHERE b.id=$1 AND b.status='paid' AND b.qr_file_id IS NOT NULL
+                FOR UPDATE OF b
+            """, booking_id)
+            if not b:
+                await q.answer("Buyurtma topilmadi, QR yo'q yoki ijara allaqachon boshlangan.", show_alert=True)
+                return
+
+            now = datetime.now(TASHKENT)
+            if b["hours"] == 0:
+                expiry = now.replace(hour=9, minute=0, second=0, microsecond=0)
+                if now >= expiry:
+                    expiry += timedelta(days=1)
+            else:
+                expiry = now + timedelta(hours=b["hours"])
+
+            await c.execute("""
+                UPDATE bookings
+                SET status='active', expires_at=$1
+                WHERE id=$2 AND status='paid' AND expires_at IS NULL
+            """, expiry.astimezone(timezone.utc), booking_id)
+
+    await bot.send_message(
+        b["user_id"],
+        f"✅ Admin akkauntga kirganingizni tasdiqladi.\n"
+        f"🎮 {b['title']}\n"
+        f"⏱ Ijara boshlandi.\n"
+        f"🕒 Bo'shash vaqti: {expiry.strftime('%d.%m.%Y %H:%M')}"
+    )
+    await q.message.edit_caption((q.message.caption or "") + "\n\n✅ MIJOZ KIRDI — IJARA BOSHLANDI")
+    await q.answer("Mijoz kirgani tasdiqlandi. Ijara vaqti boshlandi.")
+
+
+@dp.callback_query(F.data.startswith("qr_reject:"))
+async def admin_reject_customer_qr(q: CallbackQuery):
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("Ruxsat yo'q.", show_alert=True)
+        return
+
+    booking_id = int(q.data.split(":")[1])
+    async with pool.acquire() as c:
+        b = await c.fetchrow("""
+            SELECT user_id FROM bookings
+            WHERE id=$1 AND status='paid' AND qr_file_id IS NOT NULL
+        """, booking_id)
+        if not b:
+            await q.answer("QR so'rovi topilmadi yoki allaqachon ko'rib chiqilgan.", show_alert=True)
+            return
+        await c.execute("""
+            UPDATE bookings SET qr_file_id=NULL
+            WHERE id=$1 AND status='paid'
+        """, booking_id)
+
+    await bot.send_message(
+        b["user_id"],
+        "❌ QR-kod tasdiqlanmadi. Iltimos, akkauntga kirish uchun yangi QR-kod yuboring."
+    )
+    await q.message.edit_caption((q.message.caption or "") + "\n\n❌ QR-KOD RAD ETILDI")
+    await q.answer("QR-kod rad etildi.")
+
+
 @dp.message(Command("start_rental"))
 async def start_rental(m: Message):
     if m.from_user.id != ADMIN_ID:
         return
-
-    parts = (m.text or "").split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await m.answer("Foydalanish: /start_rental BUYURTMA_ID")
-        return
-
-    bid = int(parts[1])
-    async with pool.acquire() as c:
-        b = await c.fetchrow(
-            "SELECT * FROM bookings WHERE id=$1 AND status='paid'",
-            bid
-        )
-        if not b:
-            await m.answer("To'langan buyurtma topilmadi.")
-            return
-
-        now = datetime.now(TASHKENT)
-
-        if b["hours"] == 0:
-            # Tungi tarif: ijara qaysi paytda boshlanishidan qat'i nazar,
-            # eng yaqin keladigan 09:00 da tugaydi.
-            expiry = now.replace(
-                hour=9, minute=0, second=0, microsecond=0
-            )
-            if now >= expiry:
-                expiry += timedelta(days=1)
-        else:
-            expiry = now + timedelta(hours=b["hours"])
-
-        await c.execute(
-            "UPDATE bookings SET status='active', expires_at=$1 WHERE id=$2",
-            expiry.astimezone(timezone.utc), bid
-        )
-
-    await bot.send_message(
-        b["user_id"],
-        f"Ijara №{bid} boshlandi.\n"
-        f"Tugash vaqti: {expiry.strftime('%d.%m.%Y %H:%M')}"
-    )
     await m.answer(
-        f"Ijara boshlandi. Tugash vaqti: {expiry.strftime('%d.%m.%Y %H:%M')}"
+        "Ijara endi /start_rental orqali boshlanmaydi. "
+        "Mijoz QR-kodini yuborgach, QR xabaridagi "
+        "'✅ MIJOZ KIRDI — IJARANI BOSHLASH' tugmasini faqat mijoz akkauntga kirganini "
+        "tekshirgandan keyin bosing."
     )
 
 
