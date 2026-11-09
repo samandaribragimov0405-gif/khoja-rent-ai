@@ -2152,9 +2152,9 @@ def explain_ai_error(e: Exception):
     if isinstance(e, openai.AuthenticationError):
         return AI_USER_ERROR, "OPENAI_API_KEY noto'g'ri yoki bekor qilingan (401). Railway Variables'dagi kalitni tekshiring."
     if isinstance(e, openai.RateLimitError):
-        if code == "insufficient_quota":
-            return AI_USER_ERROR, "OpenAI hisobida mablag' tugagan (insufficient_quota). platform.openai.com -> Billing bo'limida balansni to'ldiring."
-        return AI_USER_ERROR, "OpenAI so'rovlar limiti oshdi (429). Birozdan keyin o'zi tiklanadi."
+        if code == "insufficient_quota" or "quota" in str(e).lower():
+            return AI_USER_ERROR, "OpenAI hisobida mablag' yo'q yoki limit tugagan (insufficient_quota). platform.openai.com -> Billing bo'limida balansni to'ldiring."
+        return AI_USER_ERROR, f"OpenAI 429 (code={code}): {str(e)[:600]}"
     if isinstance(e, openai.PermissionDeniedError):
         return AI_USER_ERROR, f"Bu modelga yoki mamlakatingizdan ruxsat yo'q (403): {e}"
     if isinstance(e, openai.NotFoundError):
@@ -2278,6 +2278,10 @@ async def ai_text_chat(m: Message):
 
 async def main():
     await init_db()
+    print(
+        "BOT ISHGA TUSHDI | AI:", "yoqilgan" if AI_CLIENT else "OPENAI_API_KEY YO'Q",
+        "| model:", AI_MODEL, "| openai:", openai.__version__
+    )
 
     # Telegram chat input yonidagi menyu tugmasini yoqadi.
     await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
