@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import asyncpg
+import openai
 from openai import AsyncOpenAI
 from collections import defaultdict, deque
 from aiogram import Bot, Dispatcher, F
@@ -21,9 +22,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 CARD_DETAILS = os.getenv("CARD_DETAILS", "Admin bilan bog'laning")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-AI_CLIENT = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
+AI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+AI_CLIENT = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=40.0, max_retries=2) if OPENAI_API_KEY else None
 AI_HISTORY = defaultdict(lambda: deque(maxlen=12))
 
 TASHKENT = ZoneInfo("Asia/Tashkent")
@@ -259,7 +260,7 @@ async def show_menu(m: Message, state: FSMContext):
 async def start(m: Message, state: FSMContext):
     await reset_user_flow(m.from_user.id, state)
     await m.answer(
-        "Assalomu alaykum! KHOJA RENT AI botiga xush kelibsiz.\\n"
+        "Assalomu alaykum! KHOJA RENT AI botiga xush kelibsiz.\n"
         "Pastdagi menyudan kerakli bo'limni tanlang:",
         reply_markup=main_reply_keyboard(m.from_user.id)
     )
@@ -2141,6 +2142,45 @@ To'lov qaytarilishi yoki nizoli masalalarda admin bilan bog'lanishni tavsiya qil
 Hech qachon admin vakolatiga ega ekaningizni yoki buyurtma holatini o'zgartirganingizni da'vo qilmang.
 """
 
+AI_USER_ERROR = "AI bilan bog'lanishda xatolik yuz berdi. Birozdan keyin urinib ko'ring yoki admin bilan bog'laning."
+_ai_alert_times = {}
+
+
+def explain_ai_error(e: Exception):
+    """(foydalanuvchiga matn, adminga aniq texnik sabab) qaytaradi."""
+    code = getattr(e, "code", None)
+    if isinstance(e, openai.AuthenticationError):
+        return AI_USER_ERROR, "OPENAI_API_KEY noto'g'ri yoki bekor qilingan (401). Railway Variables'dagi kalitni tekshiring."
+    if isinstance(e, openai.RateLimitError):
+        if code == "insufficient_quota":
+            return AI_USER_ERROR, "OpenAI hisobida mablag' tugagan (insufficient_quota). platform.openai.com -> Billing bo'limida balansni to'ldiring."
+        return AI_USER_ERROR, "OpenAI so'rovlar limiti oshdi (429). Birozdan keyin o'zi tiklanadi."
+    if isinstance(e, openai.PermissionDeniedError):
+        return AI_USER_ERROR, f"Bu modelga yoki mamlakatingizdan ruxsat yo'q (403): {e}"
+    if isinstance(e, openai.NotFoundError):
+        return AI_USER_ERROR, f"Model topilmadi (404). OPENAI_MODEL='{AI_MODEL}' nomini tekshiring: {e}"
+    if isinstance(e, openai.BadRequestError):
+        return AI_USER_ERROR, f"OpenAI so'rovni qabul qilmadi (400): {e}"
+    if isinstance(e, openai.APITimeoutError):
+        return "AI javob berishga ulgurmadi. Qayta urinib ko'ring.", "OpenAI javobi vaqtida kelmadi (timeout)."
+    if isinstance(e, openai.APIConnectionError):
+        return AI_USER_ERROR, f"OpenAI serveriga ulanib bo'lmadi: {e}"
+    return AI_USER_ERROR, f"{type(e).__name__}: {e}"
+
+
+async def notify_admin_ai_error(detail: str):
+    """Adminga xatoning haqiqiy sababini yuboradi (bir xil xabar 10 daqiqada 1 marta)."""
+    now = datetime.now(timezone.utc)
+    last = _ai_alert_times.get(detail)
+    if last and now - last < timedelta(minutes=10):
+        return
+    _ai_alert_times[detail] = now
+    try:
+        await bot.send_message(ADMIN_ID, f"⚠️ AI xatosi:\n{detail[:900]}")
+    except Exception as e:
+        print("Admin AI alert error:", repr(e))
+
+
 async def ai_reply(user_id: int, user_text: str) -> str:
     if AI_CLIENT is None:
         return "AI yordamchi hozir sozlanmagan. Admin OPENAI_API_KEY kalitini Railway Variables bo'limiga qo'shishi kerak."
@@ -2158,6 +2198,29 @@ async def ai_reply(user_id: int, user_text: str) -> str:
     history.append({"role": "assistant", "content": answer})
     return answer
 
+
+@dp.message(Command("aitest"))
+async def ai_self_test(m: Message):
+    """Admin uchun: AI ulanishini tekshiradi va aniq xato sababini ko'rsatadi."""
+    if m.from_user.id != ADMIN_ID:
+        return
+    if AI_CLIENT is None:
+        await m.answer("❌ OPENAI_API_KEY topilmadi. Railway -> Variables bo'limiga qo'shing va botni qayta ishga tushiring.")
+        return
+    try:
+        r = await AI_CLIENT.chat.completions.create(
+            model=AI_MODEL,
+            messages=[{"role": "user", "content": "Javob ber: OK"}],
+            max_tokens=10,
+        )
+        text = (r.choices[0].message.content or "").strip()
+        await m.answer(f"✅ AI ishlayapti.\nModel: {AI_MODEL}\nJavob: {text}")
+    except Exception as e:
+        _, detail = explain_ai_error(e)
+        print("AI test error:", repr(e))
+        await m.answer(f"❌ AI ishlamayapti.\nModel: {AI_MODEL}\nSabab: {detail}")
+
+
 @dp.message(StateFilter(None), F.voice)
 async def ai_voice_chat(m: Message):
     if AI_CLIENT is None:
@@ -2171,31 +2234,46 @@ async def ai_voice_chat(m: Message):
         transcription = await AI_CLIENT.audio.transcriptions.create(
             model="gpt-4o-mini-transcribe", file=audio_stream
         )
-        spoken_text = transcription.text.strip()
+        spoken_text = (transcription.text or "").strip()
         if not spoken_text:
             await status.edit_text("Ovozni tushuna olmadim. Iltimos, qayta yuboring.")
             return
         answer = await ai_reply(m.from_user.id, spoken_text)
+    except Exception as e:
+        user_msg, detail = explain_ai_error(e)
+        print("AI voice error:", repr(e))
+        await notify_admin_ai_error(detail)
+        await status.edit_text(user_msg)
+        return
+
+    # Matnli javob doim yuboriladi; ovoz (TTS) xato bersa ham foydalanuvchi javobsiz qolmaydi.
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await m.answer(f"🗣 Siz: {spoken_text}\n\n🤖 KHOJA RENT AI: {answer}")
+    try:
         speech = await AI_CLIENT.audio.speech.create(
             model="gpt-4o-mini-tts", voice="alloy", input=answer, response_format="mp3"
         )
-        await status.delete()
-        await m.answer(f"🗣 Siz: {spoken_text}\n\n🤖 KHOJA RENT AI: {answer}")
         await m.answer_voice(BufferedInputFile(speech.content, filename="khoja-rent-ai.mp3"))
     except Exception as e:
-        print("AI voice error:", repr(e))
-        await status.edit_text("Ovozli javob tayyorlashda xatolik yuz berdi. Matn orqali yozib ko'ring.")
+        print("AI TTS error:", repr(e))
+
 
 @dp.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def ai_text_chat(m: Message):
-    menu_texts = {"🎮 Akkauntlar", "🎁 BONUS", "💬 Admin bilan aloqa", "📜 Qoidalar", "⚙️ Admin paneli"}
+    menu_texts = {"🎮 Akkauntlar", "🎁 BONUS", "💬 Admin bilan aloqa", "📜 Qoidalar", "🧾 Qoidalar", "⚙️ Admin paneli"}
     if m.text in menu_texts:
         return
     try:
-        await m.answer(await ai_reply(m.from_user.id, m.text))
+        await bot.send_chat_action(m.chat.id, "typing")
+        await m.answer(await ai_reply(m.from_user.id, m.text[:2000]))
     except Exception as e:
+        user_msg, detail = explain_ai_error(e)
         print("AI text error:", repr(e))
-        await m.answer("AI bilan bog'lanishda xatolik yuz berdi. Birozdan keyin urinib ko'ring.")
+        await notify_admin_ai_error(detail)
+        await m.answer(user_msg)
 
 
 async def main():
